@@ -1,5 +1,16 @@
+use blockchain::transaction::TransactionError;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ClientError {
-    #[error("Client connecting error")]
-    ConnectionError,
+    #[error("invalid {name}: {value:?}")]
+    InvalidConfig { name: &'static str, value: String },
+
+    #[error("could not generate a key: {0}")]
+    KeyGeneration(getrandom::Error),
+
+    #[error("could not build transaction: {0}")]
+    Transaction(#[from] TransactionError),
+
+    #[error("request to node failed: {0}")]
+    Connection(#[from] reqwest::Error),
 }
