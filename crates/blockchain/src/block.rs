@@ -155,3 +155,142 @@ fn hash_bytes(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block() -> Block {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let recipient = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        let tx = Transaction::new(&recipient, 10, 0, 100, &key).unwrap();
+        Block::new(1, "0".repeat(64), vec![tx], 100, &key).unwrap()
+    }
+
+    #[test]
+    fn new_block_has_valid_commitments_and_signature() {
+        let block = block();
+        assert_eq!(block.block_data.index, 1);
+        assert_eq!(block.block_data.prev_hash, "0".repeat(64));
+        assert_eq!(block.block_data.timestamp, 100);
+        assert_eq!(block.block_data.transactions.len(), 1);
+        assert_eq!(
+            block.validator,
+            Some(SigningKey::from_bytes(&[7; 32]).verifying_key())
+        );
+        assert_eq!(block.block_data.hash.len(), 64);
+        block.verify_hashes().unwrap();
+        block.verify_signature().unwrap();
+    }
+
+    #[test]
+    fn empty_blocks_are_valid_and_deterministic() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let a = Block::new(1, "0".repeat(64), vec![], 100, &key).unwrap();
+        let b = Block::new(1, "0".repeat(64), vec![], 100, &key).unwrap();
+        a.verify_hashes().unwrap();
+        a.verify_signature().unwrap();
+        assert_eq!(a.block_data.hash, b.block_data.hash);
+        assert_eq!(a.signature, b.signature);
+        // Known SHA-256 of the empty JSON list, independent of our helper.
+        assert_eq!(
+            a.block_data.tx_root,
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        );
+    }
+
+    #[test]
+    fn modified_transactions_are_rejected() {
+        let mut block = block();
+        block.block_data.transactions[0].amount += 1;
+        assert!(matches!(
+            block.verify_hashes(),
+            Err(BlockError::InvalidTransactionRoot)
+        ));
+        // Recomputing commitments does not allow an attacker to forge a signature.
+        block.block_data.tx_root =
+            Block::calculate_tx_root(&block.block_data.transactions).unwrap();
+        block.block_data.hash = block.calculate_hash().unwrap();
+        block.verify_hashes().unwrap();
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn every_header_field_is_authenticated() {
+        let original = block();
+        let mut variants = vec![original.clone(); 5];
+        variants[0].block_data.index += 1;
+        variants[1].block_data.prev_hash = "1".repeat(64);
+        variants[2].block_data.timestamp += 1;
+        variants[3].block_data.tx_root = "1".repeat(64);
+        variants[4].validator = Some(SigningKey::from_bytes(&[9; 32]).verifying_key());
+        for mut changed in variants {
+            assert!(changed.verify_hashes().is_err());
+            changed.block_data.hash = changed.calculate_hash().unwrap();
+            assert!(matches!(
+                changed.verify_signature(),
+                Err(BlockError::InvalidSignature)
+            ));
+        }
+    }
+
+    #[test]
+    fn transaction_root_commits_to_order_count_and_signatures() {
+        let mut txs = block().block_data.transactions;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        txs.push(Transaction::new(&key.verifying_key(), 10, 1, 100, &key).unwrap());
+        let root = Block::calculate_tx_root(&txs).unwrap();
+        txs.reverse();
+        assert_ne!(root, Block::calculate_tx_root(&txs).unwrap());
+        txs.reverse();
+        txs[0].signature[0] ^= 1;
+        assert_ne!(root, Block::calculate_tx_root(&txs).unwrap());
+        txs[0].signature[0] ^= 1;
+        txs.pop();
+        assert_ne!(root, Block::calculate_tx_root(&txs).unwrap());
+    }
+
+    #[test]
+    fn missing_and_forged_signatures_are_rejected() {
+        let mut block = block();
+        block.signature = None;
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::MissingSignature)
+        ));
+        block.signature =
+            Some(SigningKey::from_bytes(&[9; 32]).sign(&block.signing_payload().unwrap()));
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::InvalidSignature)
+        ));
+        block.validator = None;
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::MissingValidator)
+        ));
+    }
+
+    #[test]
+    fn stored_hash_tampering_is_rejected() {
+        let mut block = block();
+        block.block_data.hash = "1".repeat(64);
+        assert!(matches!(
+            block.verify_hashes(),
+            Err(BlockError::InvalidHash)
+        ));
+    }
+
+    #[test]
+    fn signed_block_survives_json_round_trip() {
+        let original = block();
+        let json = serde_json::to_vec(&original).unwrap();
+        let decoded: Block = serde_json::from_slice(&json).unwrap();
+        decoded.verify_hashes().unwrap();
+        decoded.verify_signature().unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), json);
+    }
+}

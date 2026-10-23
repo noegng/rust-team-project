@@ -95,3 +95,120 @@ impl Transaction {
         ))?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transaction() -> Transaction {
+        let sender = SigningKey::from_bytes(&[7; 32]);
+        let recipient = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        Transaction::new(&recipient, 10, 3, 100, &sender).unwrap()
+    }
+
+    #[test]
+    fn new_transaction_is_signed_by_sender() {
+        let tx = transaction();
+        assert_eq!(
+            tx.from,
+            SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()
+        );
+        assert_eq!(
+            tx.to,
+            SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes()
+        );
+        assert_eq!((tx.amount, tx.nonce, tx.timestamp), (10, 3, 100));
+        assert_eq!(tx.signature.len(), 64);
+        tx.verify().unwrap();
+    }
+
+    #[test]
+    fn every_payload_field_is_authenticated() {
+        let original = transaction();
+        let mut variants = vec![original.clone(); 5];
+        variants[0].from = SigningKey::from_bytes(&[9; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        variants[1].to = SigningKey::from_bytes(&[9; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        variants[2].amount += 1;
+        variants[3].nonce += 1;
+        variants[4].timestamp += 1;
+        for tx in variants {
+            assert!(matches!(
+                tx.verify(),
+                Err(TransactionError::InvalidSignature)
+            ));
+            assert_ne!(
+                tx.calculate_hash().unwrap(),
+                original.calculate_hash().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_key_lengths_are_rejected() {
+        for length in [0, 31, 33] {
+            let mut tx = transaction();
+            tx.from = vec![0; length];
+            assert!(matches!(tx.verify(), Err(TransactionError::InvalidSender)));
+            let mut tx = transaction();
+            tx.to = vec![0; length];
+            assert!(matches!(
+                tx.verify(),
+                Err(TransactionError::InvalidRecipient)
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_and_forged_signatures_are_rejected() {
+        for signature in [vec![], vec![0; 63], vec![0; 64], vec![0; 65]] {
+            let mut tx = transaction();
+            tx.signature = signature;
+            assert!(matches!(
+                tx.verify(),
+                Err(TransactionError::InvalidSignature)
+            ));
+        }
+        let mut tx = transaction();
+        tx.signature = SigningKey::from_bytes(&[9; 32])
+            .sign(&tx.signing_payload().unwrap())
+            .to_bytes()
+            .to_vec();
+        assert!(matches!(
+            tx.verify(),
+            Err(TransactionError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn signed_transaction_survives_json_round_trip() {
+        let original = transaction();
+        let json = serde_json::to_vec(&original).unwrap();
+        let decoded: Transaction = serde_json::from_slice(&json).unwrap();
+        decoded.verify().unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), json);
+        assert_eq!(
+            decoded.calculate_hash().unwrap(),
+            original.calculate_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn hash_is_deterministic_hex_and_commits_to_signature() {
+        let mut tx = transaction();
+        let hash = tx.calculate_hash().unwrap();
+        assert_eq!(hash, transaction().calculate_hash().unwrap());
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        tx.signature[0] ^= 1;
+        assert_ne!(hash, tx.calculate_hash().unwrap());
+    }
+}
