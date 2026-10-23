@@ -3,7 +3,7 @@ mod discovery;
 mod metrics;
 mod validator;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -12,12 +12,16 @@ use axum::{
         ws::{Message, WebSocket},
     },
     response::IntoResponse,
-    routing::any,
+    routing::{any, post},
 };
-use blockchain::{block::Block, transaction::Transaction};
+use blockchain::{block::Block, chain::Chain, mempool::Mempool, transaction::Transaction};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::validator::Validator;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -25,6 +29,21 @@ pub enum NodeMessage {
     NewTx(Transaction),
     NewBlock(Block),
     Ping,
+}
+
+fn load_signing_key() -> Result<SigningKey, ()> {
+    todo!();
+}
+
+fn load_authorized_validators() -> Result<Vec<VerifyingKey>, ()> {
+    todo!();
+}
+
+struct NodeState {
+    chain: Mutex<Chain>,
+    mempool: Mutex<Mempool>,
+    signing_key: SigningKey,
+    authorized_validators: Vec<VerifyingKey>,
 }
 
 #[tokio::main]
@@ -38,9 +57,22 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // run validator
+    let signing_key = load_signing_key().unwrap();
+    let authorized_validators = load_authorized_validators().unwrap();
+
+    let state = Arc::new(NodeState {
+        chain: Mutex::new(Chain::new(authorized_validators.clone()).unwrap()),
+        mempool: Mutex::new(Mempool::new()),
+        signing_key,
+        authorized_validators,
+    });
+
     // build our application with some routes
     let app = Router::new()
         .route("/ws", any(ws_handler))
+        .route("/transactions", post(api::submit_transactions))
+        .with_state(state)
         // logging so we can see what's going on
         .layer(
             TraceLayer::new_for_http()
