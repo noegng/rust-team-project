@@ -1,16 +1,14 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::metrics::Metrics;
+use crate::{NodeMessage, NodeState};
 use blockchain::{
     block::{Block, BlockError},
     chain::{Chain, ChainError},
     mempool::{Mempool, MempoolError},
 };
 use ed25519_dalek::SigningKey;
-use tokio::sync::{Mutex, mpsc};
-
-use crate::NodeMessage;
-use crate::metrics::Metrics;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ValidatorError {
@@ -22,48 +20,61 @@ pub(crate) enum ValidatorError {
 
     #[error("could not update mempool: {0}")]
     Mempool(#[from] MempoolError),
-
-    #[error("peer channel closed")]
-    ChannelClosed,
 }
 
 /// Production de blocs PoA. Verrous pris dans l'ordre : `chain` puis `mempool`.
 pub(crate) struct Validator {
-    pub signing_key: SigningKey,
-    pub chain: Arc<Mutex<Chain>>,
-    pub mempool: Arc<Mutex<Mempool>>,
-    pub metrics: Arc<Metrics>,
-    /// Blocs produits à diffuser aux peers.
-    pub outbound: mpsc::Sender<NodeMessage>,
+    pub state: Arc<NodeState>,
     pub block_time: Duration,
 }
 
 impl Validator {
     /// Toutes les `block_time` : si c'est notre tour, produit un bloc,
     /// l'ajoute à la chaîne locale et l'envoie aux peers.
-    /// Ne s'arrête que si le canal vers les peers est fermé.
-    pub(crate) async fn run(self) -> Result<(), ValidatorError> {
+    pub(crate) async fn run(self) {
         let mut ticker = tokio::time::interval(self.block_time);
         ticker.tick().await; // le premier tick est immédiat
         loop {
             ticker.tick().await;
-            let produced = {
-                let mut chain = self.chain.lock().await;
-                let mut mempool = self.mempool.lock().await;
-                produce_block(&mut chain, &mut mempool, &self.signing_key, unix_secs())
-            };
-            match produced {
-                Ok(Some(block)) => {
-                    self.metrics.record_block(&block);
-                    self.outbound
-                        .send(NodeMessage::NewBlock(block))
-                        .await
-                        .map_err(|_| ValidatorError::ChannelClosed)?;
-                }
-                Ok(None) => {}
-                Err(err) => eprintln!("block production failed: {err}"),
+            if let Err(error) = self.state.produce_next_block(unix_secs()).await {
+                tracing::error!(%error, "block production failed");
             }
         }
+    }
+}
+
+impl NodeState {
+    pub(crate) async fn produce_next_block(&self, now_secs: u64) -> Result<(), ValidatorError> {
+        let mut chain = self.chain.lock().await;
+        let mut mempool = self.mempool.lock().await;
+        if let Some(block) = produce_block(&mut chain, &mut mempool, &self.signing_key, now_secs)? {
+            self.metrics.record_block(&block);
+            self.publish_block(block, "produced")?;
+        }
+        Ok(())
+    }
+
+    /// Ignore known blocks; reject conflicting history and invalid successors.
+    pub(crate) async fn accept_peer_block(&self, block: Block) -> Result<(), ValidatorError> {
+        let mut chain = self.chain.lock().await;
+        if let Some(known) = chain.blocks().get(block.block_data.index as usize) {
+            if known.block_data.hash == block.block_data.hash {
+                return Ok(());
+            }
+        }
+        let mut mempool = self.mempool.lock().await;
+        accept_block(&mut chain, &mut mempool, &self.metrics, block.clone())?;
+        self.publish_block(block, "received")?;
+        Ok(())
+    }
+
+    fn publish_block(&self, block: Block, action: &str) -> Result<(), ValidatorError> {
+        let text = serde_json::to_string(&NodeMessage::NewBlock(block.clone()))
+            .map_err(BlockError::from)?;
+        let _ = self.gossip.send(text);
+        tracing::info!(index = block.block_data.index, hash = %block.block_data.hash,
+            transactions = block.block_data.transactions.len(), %action, "block added");
+        Ok(())
     }
 }
 
@@ -220,5 +231,51 @@ mod tests {
             Err(ValidatorError::Chain(ChainError::InvalidIndex { .. }))
         ));
         assert_eq!(chain.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn received_blocks_are_validated_counted_and_relayed_once() {
+        let validators = vec![key(1).verifying_key(), key(2).verifying_key()];
+        let state = NodeState::new(key(1), validators.clone()).unwrap();
+        state.submit_transaction(tx(0)).await.unwrap();
+        let mut events = state.gossip.subscribe();
+        let chain = Chain::new(validators).unwrap();
+        let invalid = Block::new(
+            1,
+            chain.last().block_data.hash.clone(),
+            vec![tx(0)],
+            10,
+            &key(1),
+        )
+        .unwrap();
+        assert!(state.accept_peer_block(invalid).await.is_err());
+        assert_eq!(state.chain.lock().await.len(), 1);
+        assert_eq!(state.mempool.lock().await.len(), 1);
+        assert!(events.try_recv().is_err());
+
+        let block = Block::new(
+            1,
+            chain.last().block_data.hash.clone(),
+            vec![tx(0)],
+            10,
+            &key(2),
+        )
+        .unwrap();
+        state.accept_peer_block(block.clone()).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<NodeMessage>(&events.try_recv().unwrap()).unwrap(),
+            NodeMessage::NewBlock(_)
+        ));
+        state.accept_peer_block(block).await.unwrap();
+        assert!(events.try_recv().is_err());
+        assert_eq!(state.chain.lock().await.len(), 2);
+        assert!(state.mempool.lock().await.is_empty());
+        assert_eq!(state.metrics.snapshot(2, 0).txs_committed, 1);
+    }
+
+    #[test]
+    fn node_requires_an_authorized_key_and_unique_validators() {
+        assert!(NodeState::new(key(1), vec![key(2).verifying_key()]).is_err());
+        assert!(NodeState::new(key(1), vec![key(1).verifying_key(); 2]).is_err());
     }
 }

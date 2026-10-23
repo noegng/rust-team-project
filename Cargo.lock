@@ -207,6 +207,7 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "blockchain",
  "ed25519-dalek",
  "getrandom 0.3.4",
@@ -1051,6 +1052,7 @@ dependencies = [
  "futures-util",
  "hex",
  "mdns-sd",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

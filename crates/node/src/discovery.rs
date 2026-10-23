@@ -1,12 +1,16 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use tokio_tungstenite::tungstenite::Message;
+
+use crate::{NodeState, p2p};
 
 const SERVICE_TYPE: &str = "_authora._tcp.local.";
 
-pub async fn discover_peers(node_id: String, port: u16) -> anyhow::Result<()> {
+pub(crate) async fn discover_peers(
+    node_id: String,
+    port: u16,
+    state: Arc<NodeState>,
+) -> anyhow::Result<()> {
     let mdns = ServiceDaemon::new()?;
     let hostname = format!("node-{node_id}.local.");
 
@@ -41,16 +45,16 @@ pub async fn discover_peers(node_id: String, port: u16) -> anyhow::Result<()> {
             .into_iter()
             .map(|ip| format!("ws://{ip}:{}/ws", peer.get_port()))
             .collect();
-        tokio::spawn(connect_peer(urls));
+        tokio::spawn(connect_peer(urls, Arc::clone(&state)));
     }
 
     Ok(())
 }
 
-async fn connect_peer(urls: Vec<String>) {
+async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>) {
     loop {
         for url in &urls {
-            let Ok(Ok((mut socket, _))) = tokio::time::timeout(
+            let Ok(Ok((socket, _))) = tokio::time::timeout(
                 Duration::from_secs(5),
                 tokio_tungstenite::connect_async(url.as_str()),
             )
@@ -60,19 +64,7 @@ async fn connect_peer(urls: Vec<String>) {
             };
 
             println!("Connected to peer: {url}");
-            if socket
-                .send(Message::Text("Hello from this node".into()))
-                .await
-                .is_ok()
-            {
-                while let Some(message) = socket.next().await {
-                    match message {
-                        Ok(Message::Text(text)) => println!("From {url}: {text}"),
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
-                    }
-                }
-            }
+            p2p::handle_peer(socket, Arc::clone(&state)).await;
             println!("Peer disconnected: {url}");
             break;
         }

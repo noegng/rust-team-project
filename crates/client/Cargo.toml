@@ -13,3 +13,6 @@ anyhow = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = "0.3.4"
 reqwest = { version = "0.13.5", features = ["json"] }
+
+[dev-dependencies]
+axum = { workspace = true }
