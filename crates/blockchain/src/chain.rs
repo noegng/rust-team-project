@@ -1,7 +1,4 @@
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
-
-use crate::block::Block;
+use crate::block::{Block, BlockData};
 
 /// Hash hex du bloc genesis précédent (aucun parent).
 pub const GENESIS_PREV_HASH: &str =
@@ -38,10 +35,10 @@ impl Chain {
     /// index, lien avec le bloc précédent, hash et signature du validateur.
     pub fn is_valid_successor(&self, block: &Block) -> bool {
         let last = self.last();
-        block.index == last.index + 1
-            && block.prev_hash == last.hash
-            && block.hash == compute_block_hash(block)
-            && verify_block_signature(block)
+        last.block_data.index.checked_add(1) == Some(block.block_data.index)
+            && block.block_data.prev_hash == last.block_data.hash
+            && block.verify_hashes().is_ok()
+            && block.verify_signature().is_ok()
     }
 
     /// Ajoute le bloc s'il est un successeur valide. Retourne `false` sinon.
@@ -63,54 +60,120 @@ impl Default for Chain {
 /// Bloc 0, identique sur tous les nodes (pas de validateur ni de signature).
 pub fn genesis_block() -> Block {
     let mut block = Block {
-        index: 0,
-        prev_hash: GENESIS_PREV_HASH.to_string(),
-        tx_root: compute_tx_root(&[]),
-        timestamp: 0,
-        validator: Vec::new(),
-        signature: Vec::new(),
-        hash: String::new(),
+        block_data: BlockData {
+            index: 0,
+            prev_hash: GENESIS_PREV_HASH.to_string(),
+            tx_root: Block::calculate_tx_root(&[])
+                .expect("empty transaction list can be serialized"),
+            timestamp: 0,
+            hash: String::new(),
+            transactions: Vec::new(),
+        },
+        validator: None,
+        signature: None,
     };
-    block.hash = compute_block_hash(&block);
+    block.block_data.hash = block
+        .calculate_hash()
+        .expect("fixed genesis payload can be serialized");
     block
 }
 
-/// Hash hex de l'en-tête du bloc (tout sauf `signature` et `hash`).
-/// C'est ce hash que le validateur signe.
-pub fn compute_block_hash(block: &Block) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(block.index.to_le_bytes());
-    hasher.update(block.prev_hash.as_bytes());
-    hasher.update(block.tx_root.as_bytes());
-    hasher.update(block.timestamp.to_le_bytes());
-    hasher.update(&block.validator);
-    to_hex(&hasher.finalize())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{block::BlockError, transaction::Transaction};
+    use ed25519_dalek::SigningKey;
 
-/// Hash hex de la liste des hash de TX incluses dans le bloc.
-pub fn compute_tx_root(tx_hashes: &[String]) -> String {
-    let mut hasher = Sha256::new();
-    for hash in tx_hashes {
-        hasher.update(hash.as_bytes());
+    fn successor(chain: &Chain) -> Block {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let tx = Transaction::new(&key.verifying_key(), 10, 0, 1, &key).unwrap();
+        Block::new(
+            chain.len(),
+            chain.last().block_data.hash.clone(),
+            vec![tx],
+            1,
+            &key,
+        )
+        .unwrap()
     }
-    to_hex(&hasher.finalize())
-}
 
-/// Vérifie que `block.signature` est la signature de `block.hash`
-/// par la clé `block.validator`.
-pub fn verify_block_signature(block: &Block) -> bool {
-    let Ok(key_bytes) = <[u8; 32]>::try_from(block.validator.as_slice()) else {
-        return false;
-    };
-    let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else {
-        return false;
-    };
-    let Ok(signature) = Signature::from_slice(&block.signature) else {
-        return false;
-    };
-    key.verify(block.hash.as_bytes(), &signature).is_ok()
-}
+    #[test]
+    fn genesis_is_deterministic_and_unsigned() {
+        let genesis = genesis_block();
+        assert_eq!(genesis.block_data.hash, genesis_block().block_data.hash);
+        assert_eq!(genesis.block_data.hash.len(), 64);
+        assert!(genesis.validator.is_none());
+        assert!(genesis.signature.is_none());
+        genesis.verify_hashes().unwrap();
+    }
 
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    #[test]
+    fn signed_block_survives_serialization_and_can_be_appended() {
+        let mut chain = Chain::new();
+        let block = successor(&chain);
+        let encoded = serde_json::to_vec(&block).unwrap();
+        let decoded: Block = serde_json::from_slice(&encoded).unwrap();
+        decoded.verify_hashes().unwrap();
+        decoded.verify_signature().unwrap();
+        assert!(chain.push(decoded));
+    }
+
+    #[test]
+    fn transaction_tampering_is_rejected_even_if_commitments_are_recomputed() {
+        let chain = Chain::new();
+        let mut block = successor(&chain);
+        block.block_data.transactions[0].amount += 1;
+        assert!(matches!(
+            block.verify_hashes(),
+            Err(BlockError::InvalidTransactionRoot)
+        ));
+        assert!(!chain.is_valid_successor(&block));
+        block.block_data.tx_root =
+            Block::calculate_tx_root(&block.block_data.transactions).unwrap();
+        assert!(matches!(
+            block.verify_hashes(),
+            Err(BlockError::InvalidHash)
+        ));
+        block.block_data.hash = block.calculate_hash().unwrap();
+        block.verify_hashes().unwrap();
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::InvalidSignature)
+        ));
+        assert!(!chain.is_valid_successor(&block));
+    }
+
+    #[test]
+    fn changed_validator_and_missing_signature_are_rejected() {
+        let chain = Chain::new();
+        let mut block = successor(&chain);
+        block.validator = Some(SigningKey::from_bytes(&[8; 32]).verifying_key());
+        block.block_data.hash = block.calculate_hash().unwrap();
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::InvalidSignature)
+        ));
+        assert!(!chain.is_valid_successor(&block));
+        block.signature = None;
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::MissingSignature)
+        ));
+        block.validator = None;
+        assert!(matches!(
+            block.verify_signature(),
+            Err(BlockError::MissingValidator)
+        ));
+    }
+
+    #[test]
+    fn wrong_parent_and_index_are_rejected() {
+        let chain = Chain::new();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let wrong_parent = Block::new(1, "wrong".into(), vec![], 1, &key).unwrap();
+        let wrong_index =
+            Block::new(2, chain.last().block_data.hash.clone(), vec![], 1, &key).unwrap();
+        assert!(!chain.is_valid_successor(&wrong_parent));
+        assert!(!chain.is_valid_successor(&wrong_index));
+    }
 }

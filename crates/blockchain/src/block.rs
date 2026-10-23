@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -10,18 +10,74 @@ pub type PublicKey = [u8; 32];
 pub enum BlockError {
     #[error("could not serialize block data: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("invalid block index")]
+    InvalidIndex,
+
+    #[error("invalid block timestamp")]
+    InvalidTimestamp,
+
+    #[error("previous block hash does not match")]
+    InvalidPreviousHash,
+
+    #[error("block hash does not match its contents")]
+    InvalidHash,
+
+    #[error("transaction root does not match the transactions")]
+    InvalidTransactionRoot,
+
+    #[error("missing validator")]
+    MissingValidator,
+
+    #[error("validator is not authorized")]
+    UnauthorizedValidator,
+
+    #[error("missing block signature")]
+    MissingSignature,
+
+    #[error("invalid block signature")]
+    InvalidSignature,
+
+    #[error("invalid transaction: {0}")]
+    InvalidTransaction(#[from] crate::transaction::TransactionError),
+
+    #[error("duplicate transaction in block")]
+    DuplicateTransaction,
+
+    #[error("block does not match the expected genesis block")]
+    InvalidGenesis,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BlockData {
+    pub index: u64,
+    pub timestamp: u64,
+    pub prev_hash: String,
+    pub hash: String,
+    pub transactions: Vec<Transaction>,
+    pub tx_root: String,
+}
+
+impl BlockData {
+    /// Exact bytes signed by the producer; used by `node` to verify the signature.
+    /// Fixed field order and a protocol tag define the encoding.
+    pub fn signing_payload(&self, validator: Option<VerifyingKey>) -> Result<Vec<u8>, BlockError> {
+        Ok(serde_json::to_vec(&(
+            "authora:block:v1",
+            self.index,
+            &self.prev_hash,
+            &self.tx_root,
+            self.timestamp,
+            validator,
+        ))?)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Block {
-    pub index: u64,
-    pub prev_hash: String,
-    pub tx_root: String,
-    pub timestamp: u64,
-    pub validator: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub hash: String,
-    pub transactions: Vec<Transaction>,
+    pub block_data: BlockData,
+    pub validator: Option<VerifyingKey>,
+    pub signature: Option<Signature>,
 }
 
 impl Block {
@@ -33,21 +89,24 @@ impl Block {
         timestamp: u64,
         signing_key: &SigningKey,
     ) -> Result<Self, BlockError> {
-        let mut block = Self {
+        let block_data = BlockData {
             index,
             prev_hash,
             tx_root: Self::calculate_tx_root(&transactions)?,
             timestamp,
-            validator: signing_key.verifying_key().to_bytes().to_vec(),
-            signature: Vec::new(),
             hash: String::new(),
             transactions,
         };
-        block.hash = block.calculate_hash()?;
-        block.signature = signing_key
-            .sign(&block.signing_payload()?)
-            .to_bytes()
-            .to_vec();
+
+        let validator = Some(signing_key.verifying_key());
+        let mut block = Self {
+            block_data,
+            validator,
+            signature: None,
+        };
+        block.block_data.hash = block.calculate_hash()?;
+        block.signature = Some(signing_key.sign(&block.signing_payload()?));
+
         Ok(block)
     }
 
@@ -59,17 +118,34 @@ impl Block {
         Ok(hash_bytes(&self.signing_payload()?))
     }
 
-    /// Exact bytes signed by the producer; used by `node` to verify the signature.
-    /// Fixed field order and a protocol tag define the encoding.
     pub fn signing_payload(&self) -> Result<Vec<u8>, BlockError> {
-        Ok(serde_json::to_vec(&(
-            "authora:block:v1",
-            self.index,
-            &self.prev_hash,
-            &self.tx_root,
-            self.timestamp,
-            &self.validator,
-        ))?)
+        self.block_data.signing_payload(self.validator)
+    }
+
+    /// Recompute both commitments before accepting a received block.
+    pub fn verify_hashes(&self) -> Result<(), BlockError> {
+        if Self::calculate_tx_root(&self.block_data.transactions)? != self.block_data.tx_root {
+            return Err(BlockError::InvalidTransactionRoot);
+        }
+        if self.calculate_hash()? != self.block_data.hash {
+            return Err(BlockError::InvalidHash);
+        }
+        Ok(())
+    }
+
+    /// Genesis is accepted separately; ordinary blocks require a signer.
+    pub fn verify_signature(&self) -> Result<(), BlockError> {
+        let validator = self
+            .validator
+            .as_ref()
+            .ok_or(BlockError::MissingValidator)?;
+        let signature = self
+            .signature
+            .as_ref()
+            .ok_or(BlockError::MissingSignature)?;
+        validator
+            .verify_strict(&self.signing_payload()?, signature)
+            .map_err(|_| BlockError::InvalidSignature)
     }
 }
 
