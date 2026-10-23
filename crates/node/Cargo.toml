@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
+ed25519-dalek = { workspace = true }

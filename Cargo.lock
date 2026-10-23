@@ -960,6 +960,7 @@ dependencies = [
  "anyhow",
  "axum",
  "blockchain",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "thiserror",
