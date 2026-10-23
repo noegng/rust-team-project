@@ -7,10 +7,9 @@ use blockchain::{
     mempool::{Mempool, MempoolError},
 };
 use ed25519_dalek::SigningKey;
-use tokio::sync::{Mutex, mpsc};
 
-use crate::NodeMessage;
 use crate::metrics::Metrics;
+use crate::{NodeMessage, NodeState};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ValidatorError {
@@ -22,46 +21,40 @@ pub(crate) enum ValidatorError {
 
     #[error("could not update mempool: {0}")]
     Mempool(#[from] MempoolError),
-
-    #[error("peer channel closed")]
-    ChannelClosed,
 }
 
 /// Production de blocs PoA. Verrous pris dans l'ordre : `chain` puis `mempool`.
 pub(crate) struct Validator {
-    pub signing_key: SigningKey,
-    pub chain: Arc<Mutex<Chain>>,
-    pub mempool: Arc<Mutex<Mempool>>,
-    pub metrics: Arc<Metrics>,
-    /// Blocs produits à diffuser aux peers.
-    pub outbound: mpsc::Sender<NodeMessage>,
-    pub block_time: Duration,
+    pub(crate) state: Arc<NodeState>,
+    pub(crate) block_time: Duration,
 }
 
 impl Validator {
     /// Toutes les `block_time` : si c'est notre tour, produit un bloc,
     /// l'ajoute à la chaîne locale et l'envoie aux peers.
-    /// Ne s'arrête que si le canal vers les peers est fermé.
-    pub(crate) async fn run(self) -> Result<(), ValidatorError> {
+    pub(crate) async fn run(self) {
+        let state = &self.state;
         let mut ticker = tokio::time::interval(self.block_time);
         ticker.tick().await; // le premier tick est immédiat
         loop {
             ticker.tick().await;
             let produced = {
-                let mut chain = self.chain.lock().await;
-                let mut mempool = self.mempool.lock().await;
-                produce_block(&mut chain, &mut mempool, &self.signing_key, unix_secs())
+                let mut chain = state.chain.lock().await;
+                let mut mempool = state.mempool.lock().await;
+                produce_block(&mut chain, &mut mempool, &state.signing_key, unix_secs())
             };
             match produced {
                 Ok(Some(block)) => {
-                    self.metrics.record_block(&block);
-                    self.outbound
-                        .send(NodeMessage::NewBlock(block))
-                        .await
-                        .map_err(|_| ValidatorError::ChannelClosed)?;
+                    tracing::info!(
+                        index = block.block_data.index,
+                        txs = block.block_data.transactions.len(),
+                        "block produced"
+                    );
+                    state.metrics.record_block(&block);
+                    state.broadcast(&NodeMessage::NewBlock(block));
                 }
                 Ok(None) => {}
-                Err(err) => eprintln!("block production failed: {err}"),
+                Err(err) => tracing::error!("block production failed: {err}"),
             }
         }
     }

@@ -1,12 +1,18 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::{NodeState, p2p};
+
 const SERVICE_TYPE: &str = "_authora._tcp.local.";
 
-pub async fn discover_peers(node_id: String, port: u16) -> anyhow::Result<()> {
+pub async fn discover_peers(
+    node_id: String,
+    port: u16,
+    state: Arc<NodeState>,
+) -> anyhow::Result<()> {
     let mdns = ServiceDaemon::new()?;
     let hostname = format!("node-{node_id}.local.");
 
@@ -41,13 +47,15 @@ pub async fn discover_peers(node_id: String, port: u16) -> anyhow::Result<()> {
             .into_iter()
             .map(|ip| format!("ws://{ip}:{}/ws", peer.get_port()))
             .collect();
-        tokio::spawn(connect_peer(urls));
+        tokio::spawn(connect_peer(urls, Arc::clone(&state)));
     }
 
     Ok(())
 }
 
-async fn connect_peer(urls: Vec<String>) {
+/// Dials the peer (reconnecting forever), forwards gossip to it
+/// and handles the messages it sends.
+async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>) {
     loop {
         for url in &urls {
             let Ok(Ok((mut socket, _))) = tokio::time::timeout(
@@ -60,17 +68,22 @@ async fn connect_peer(urls: Vec<String>) {
             };
 
             println!("Connected to peer: {url}");
-            if socket
-                .send(Message::Text("Hello from this node".into()))
-                .await
-                .is_ok()
-            {
-                while let Some(message) = socket.next().await {
-                    match message {
-                        Ok(Message::Text(text)) => println!("From {url}: {text}"),
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
-                    }
+            let mut outgoing = state.peers.subscribe();
+            loop {
+                tokio::select! {
+                    incoming = socket.next() => match incoming {
+                        Some(Ok(Message::Text(text))) => p2p::handle_message(&state, text.as_str()).await,
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    },
+                    message = p2p::next_outgoing(&mut outgoing, url) => match message {
+                        Some(text) => {
+                            if socket.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
                 }
             }
             println!("Peer disconnected: {url}");

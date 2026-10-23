@@ -4,7 +4,7 @@ use axum::{Json, extract::State};
 use blockchain::transaction::Transaction;
 use serde::Serialize;
 
-use crate::NodeState;
+use crate::{NodeMessage, NodeState};
 
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -14,30 +14,37 @@ pub(crate) enum TransactionResult {
 }
 
 /// Results follow the same order as the submitted transactions.
+/// Accepted transactions are gossiped to the peers.
 pub(crate) async fn submit_transactions(
     State(state): State<Arc<NodeState>>,
     Json(transactions): Json<Vec<Transaction>>,
 ) -> Json<Vec<TransactionResult>> {
-    let mut mempool = state.mempool.lock().await;
-    Json(
+    let mut accepted = Vec::new();
+    let results = {
+        let mut mempool = state.mempool.lock().await;
         transactions
             .into_iter()
-            .map(|tx| match mempool.add(tx) {
-                Ok(hash) => TransactionResult::Accepted { hash },
+            .map(|tx| match mempool.add(tx.clone()) {
+                Ok(hash) => {
+                    accepted.push(tx);
+                    TransactionResult::Accepted { hash }
+                }
                 Err(error) => TransactionResult::Rejected {
                     error: error.to_string(),
                 },
             })
-            .collect(),
-    )
+            .collect()
+    };
+    for tx in accepted {
+        state.broadcast(&NodeMessage::NewTx(tx));
+    }
+    Json(results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blockchain::{chain::Chain, mempool::Mempool};
     use ed25519_dalek::SigningKey;
-    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn batch_accepts_valid_and_rejects_duplicate_and_tampered_transactions() {
@@ -47,16 +54,12 @@ mod tests {
         let hash = tx.calculate_hash().unwrap();
         let mut invalid = tx.clone();
         invalid.amount += 1;
-        let state = Arc::new(NodeState {
-            chain: Mutex::new(Chain::new(validators.clone()).unwrap()),
-            mempool: Mutex::new(Mempool::new()),
-            signing_key: key,
-            authorized_validators: validators,
-        });
+        let state = Arc::new(NodeState::new(key, validators).unwrap());
+        let mut outgoing = state.peers.subscribe();
 
         let Json(results) = submit_transactions(
             State(Arc::clone(&state)),
-            Json(vec![tx.clone(), tx, invalid]),
+            Json(vec![tx.clone(), tx.clone(), invalid]),
         )
         .await;
 
@@ -71,5 +74,13 @@ mod tests {
             serde_json::to_value(&results[0]).unwrap(),
             serde_json::json!({"status": "accepted", "hash": hash}),
         );
+
+        // Seule la TX acceptée est diffusée aux peers.
+        let gossiped = outgoing.try_recv().unwrap();
+        assert_eq!(
+            gossiped,
+            serde_json::to_string(&NodeMessage::NewTx(tx)).unwrap()
+        );
+        assert!(outgoing.try_recv().is_err());
     }
 }

@@ -1,17 +1,20 @@
 mod errors;
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use blockchain::transaction::Transaction;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use serde::Deserialize;
 
 use crate::errors::ClientError;
 
-/// Benchmark : envoie `TX_COUNT` TX signées sur `NODE_URL` avec `CONCURRENCY`
-/// tâches en parallèle, puis affiche le TPS côté client et `GET /metrics`
-/// de chaque node de `METRICS_URLS` (séparées par des virgules).
+/// Benchmark : envoie `TX_COUNT` TX signées sur `NODE_URL/transactions`,
+/// par lots de `BATCH_SIZE`, avec `CONCURRENCY` tâches en parallèle, puis affiche
+/// le TPS côté client et `GET /metrics` de chaque node de `METRICS_URLS`
+/// (séparées par des virgules).
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::from_env(|name| std::env::var(name).ok())?;
@@ -20,17 +23,20 @@ async fn main() -> anyhow::Result<()> {
     let recipient = random_key()?.verifying_key();
 
     println!(
-        "sending {} TX to {} with {} tasks",
-        config.tx_count, config.node_url, config.concurrency
+        "sending {} TX to {} with {} tasks, {} TX per request",
+        config.tx_count, config.node_url, config.concurrency, config.batch_size
     );
     let started = Instant::now();
     let handles: Vec<_> = split_work(config.tx_count, config.concurrency)
         .into_iter()
         .map(|count| {
             let client = client.clone();
-            let url = format!("{}/tx", config.node_url);
+            let url = format!("{}/transactions", config.node_url);
+            let batch_size = config.batch_size;
             let counters = Arc::clone(&counters);
-            tokio::spawn(async move { spam(client, url, recipient, count, counters).await })
+            tokio::spawn(
+                async move { spam(client, url, recipient, count, batch_size, counters).await },
+            )
         })
         .collect();
     for handle in handles {
@@ -62,6 +68,7 @@ struct Config {
     node_url: String,
     tx_count: u64,
     concurrency: u64,
+    batch_size: u64,
     metrics_urls: Vec<String>,
 }
 
@@ -69,13 +76,8 @@ impl Config {
     fn from_env(var: impl Fn(&str) -> Option<String>) -> Result<Self, ClientError> {
         let node_url = var("NODE_URL").unwrap_or_else(|| "http://127.0.0.1:8001".into());
         let tx_count = parse_number(&var, "TX_COUNT", 10_000)?;
-        let concurrency = parse_number(&var, "CONCURRENCY", 50)?;
-        if concurrency == 0 {
-            return Err(ClientError::InvalidConfig {
-                name: "CONCURRENCY",
-                value: "0".into(),
-            });
-        }
+        let concurrency = parse_positive(&var, "CONCURRENCY", 50)?;
+        let batch_size = parse_positive(&var, "BATCH_SIZE", 100)?;
         let metrics_urls = match var("METRICS_URLS") {
             Some(urls) => urls.split(',').map(|url| url.trim().to_string()).collect(),
             None => vec![node_url.clone()],
@@ -84,8 +86,23 @@ impl Config {
             node_url,
             tx_count,
             concurrency,
+            batch_size,
             metrics_urls,
         })
+    }
+}
+
+fn parse_positive(
+    var: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u64,
+) -> Result<u64, ClientError> {
+    match parse_number(var, name, default)? {
+        0 => Err(ClientError::InvalidConfig {
+            name,
+            value: "0".into(),
+        }),
+        value => Ok(value),
     }
 }
 
@@ -108,27 +125,58 @@ struct Counters {
     rejected: AtomicU64,
 }
 
+/// Réponse de `POST /transactions` : une entrée par TX, dans le même ordre.
+#[derive(Deserialize)]
+struct TransactionResult {
+    status: TransactionStatus,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum TransactionStatus {
+    Accepted,
+    Rejected,
+}
+
 /// Une tâche = un expéditeur avec sa propre clé : ses nonces partent de 0
-/// et arrivent dans l'ordre sur le node.
+/// et arrivent dans l'ordre sur le node, lot après lot.
 async fn spam(
     client: reqwest::Client,
     url: String,
     recipient: VerifyingKey,
     count: u64,
+    batch_size: u64,
     counters: Arc<Counters>,
 ) -> Result<(), ClientError> {
     let sender = random_key()?;
-    for nonce in 0..count {
-        let tx = Transaction::new(&recipient, 1, nonce, unix_secs(), &sender)?;
-        let response = client.post(&url).json(&tx).send().await?;
-        let counter = if response.status().is_success() {
-            &counters.accepted
-        } else {
-            &counters.rejected
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+    for nonces in nonce_batches(count, batch_size) {
+        let batch = nonces
+            .map(|nonce| Transaction::new(&recipient, 1, nonce, unix_secs(), &sender))
+            .collect::<Result<Vec<_>, _>>()?;
+        let results: Vec<TransactionResult> = client
+            .post(&url)
+            .json(&batch)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        for result in results {
+            let counter = match result.status {
+                TransactionStatus::Accepted => &counters.accepted,
+                TransactionStatus::Rejected => &counters.rejected,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
     Ok(())
+}
+
+/// Nonces `0..count` découpés en lots consécutifs d'au plus `batch_size`.
+fn nonce_batches(count: u64, batch_size: u64) -> impl Iterator<Item = Range<u64>> {
+    (0..count)
+        .step_by(batch_size as usize)
+        .map(move |start| start..count.min(start + batch_size))
 }
 
 async fn fetch_metrics(
@@ -181,6 +229,7 @@ mod tests {
                 node_url: "http://127.0.0.1:8001".into(),
                 tx_count: 10_000,
                 concurrency: 50,
+                batch_size: 100,
                 metrics_urls: vec!["http://127.0.0.1:8001".into()],
             }
         );
@@ -192,11 +241,13 @@ mod tests {
             ("NODE_URL", "http://a:8001"),
             ("TX_COUNT", "100"),
             ("CONCURRENCY", "4"),
+            ("BATCH_SIZE", "10"),
             ("METRICS_URLS", "http://a:8001, http://b:8002"),
         ]))
         .unwrap();
         assert_eq!(config.tx_count, 100);
         assert_eq!(config.concurrency, 4);
+        assert_eq!(config.batch_size, 10);
         assert_eq!(config.metrics_urls, ["http://a:8001", "http://b:8002"]);
     }
 
@@ -216,6 +267,30 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            Config::from_env(vars(&[("BATCH_SIZE", "0")])),
+            Err(ClientError::InvalidConfig {
+                name: "BATCH_SIZE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn nonces_are_batched_in_order() {
+        assert_eq!(nonce_batches(5, 2).collect::<Vec<_>>(), [0..2, 2..4, 4..5]);
+        assert_eq!(nonce_batches(0, 2).count(), 0);
+    }
+
+    #[test]
+    fn api_response_is_parsed() {
+        let body = r#"[{"status":"accepted","hash":"ab"},{"status":"rejected","error":"x"}]"#;
+        let results: Vec<TransactionResult> = serde_json::from_str(body).unwrap();
+        let statuses: Vec<_> = results.into_iter().map(|result| result.status).collect();
+        assert_eq!(
+            statuses,
+            [TransactionStatus::Accepted, TransactionStatus::Rejected]
+        );
     }
 
     #[test]
