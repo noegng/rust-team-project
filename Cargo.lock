@@ -199,6 +199,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blockchain",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
  "reqwest",
  "serde",
  "serde_json",
@@ -1215,6 +1217,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
