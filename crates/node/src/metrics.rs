@@ -98,9 +98,9 @@ impl Average {
     }
 }
 
-/// Âge d'un timestamp de TX (secondes Unix) en millisecondes.
-fn age_ms(timestamp_secs: u64, now_ms: u64) -> u64 {
-    now_ms.saturating_sub(timestamp_secs.saturating_mul(1000))
+/// Âge d'un timestamp de TX (millisecondes Unix, posé par le client).
+fn age_ms(timestamp_ms: u64, now_ms: u64) -> u64 {
+    now_ms.saturating_sub(timestamp_ms)
 }
 
 fn unix_millis() -> u64 {
@@ -131,11 +131,11 @@ mod tests {
     #[test]
     fn records_propagation_and_finality() {
         let metrics = Metrics::new();
-        metrics.record_tx_at(&tx(10), 10_200);
-        metrics.record_tx_at(&tx(10), 10_400);
+        metrics.record_tx_at(&tx(10_000), 10_200);
+        metrics.record_tx_at(&tx(10_000), 10_400);
 
         let key = SigningKey::from_bytes(&[2; 32]);
-        let block = Block::new(1, "prev".into(), vec![tx(10), tx(11)], 12, &key).unwrap();
+        let block = Block::new(1, "prev".into(), vec![tx(10_000), tx(11_000)], 12, &key).unwrap();
         metrics.record_block_at(&block, 12_000);
 
         let snapshot = metrics.snapshot(2, 3);
@@ -149,6 +149,6 @@ mod tests {
 
     #[test]
     fn timestamp_in_the_future_counts_as_zero() {
-        assert_eq!(age_ms(20, 10_000), 0);
+        assert_eq!(age_ms(20_000, 10_000), 0);
     }
 }

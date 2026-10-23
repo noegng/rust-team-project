@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -58,7 +58,7 @@ pub async fn discover_peers(
 async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>) {
     loop {
         for url in &urls {
-            let Ok(Ok((mut socket, _))) = tokio::time::timeout(
+            let Ok(Ok((socket, _))) = tokio::time::timeout(
                 Duration::from_secs(5),
                 tokio_tungstenite::connect_async(url.as_str()),
             )
@@ -67,26 +67,22 @@ async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>) {
                 continue;
             };
 
-            println!("Connected to peer: {url}");
-            let mut outgoing = state.peers.subscribe();
+            tracing::info!("connected to peer: {url}");
+            let (sink, mut stream) = socket.split();
+            let mut writer =
+                p2p::spawn_writer(&state, url.clone(), sink, |text| Message::Text(text.into()));
             loop {
                 tokio::select! {
-                    incoming = socket.next() => match incoming {
+                    incoming = stream.next() => match incoming {
                         Some(Ok(Message::Text(text))) => p2p::handle_message(&state, text.as_str()).await,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                         Some(Ok(_)) => {}
                     },
-                    message = p2p::next_outgoing(&mut outgoing, url) => match message {
-                        Some(text) => {
-                            if socket.send(Message::Text(text.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    },
+                    _ = &mut writer => break,
                 }
             }
-            println!("Peer disconnected: {url}");
+            writer.abort();
+            tracing::info!("peer disconnected: {url}");
             break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;

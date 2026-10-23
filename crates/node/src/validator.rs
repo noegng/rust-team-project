@@ -51,7 +51,7 @@ impl Validator {
                         "block produced"
                     );
                     state.metrics.record_block(&block);
-                    state.broadcast(&NodeMessage::NewBlock(block));
+                    state.broadcast(&NodeMessage::NewBlock(Box::new(block)));
                 }
                 Ok(None) => {}
                 Err(err) => tracing::error!("block production failed: {err}"),

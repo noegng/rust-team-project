@@ -4,7 +4,7 @@ use axum::{Json, extract::State};
 use blockchain::transaction::Transaction;
 use serde::Serialize;
 
-use crate::{NodeMessage, NodeState};
+use crate::{NodeMessage, NodeState, metrics::MetricsSnapshot};
 
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -36,9 +36,17 @@ pub(crate) async fn submit_transactions(
             .collect()
     };
     for tx in accepted {
+        state.metrics.record_tx(&tx);
         state.broadcast(&NodeMessage::NewTx(tx));
     }
     Json(results)
+}
+
+/// `GET /metrics`: compared across nodes by the client after a benchmark.
+pub(crate) async fn metrics(State(state): State<Arc<NodeState>>) -> Json<MetricsSnapshot> {
+    let chain_len = state.chain.lock().await.len();
+    let mempool_len = state.mempool.lock().await.len();
+    Json(state.metrics.snapshot(chain_len, mempool_len))
 }
 
 #[cfg(test)]
@@ -82,5 +90,9 @@ mod tests {
             serde_json::to_string(&NodeMessage::NewTx(tx)).unwrap()
         );
         assert!(outgoing.try_recv().is_err());
+
+        let Json(snapshot) = metrics(State(state)).await;
+        assert_eq!(snapshot.txs_received, 1);
+        assert_eq!((snapshot.chain_len, snapshot.mempool_len), (1, 1));
     }
 }

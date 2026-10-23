@@ -1,9 +1,10 @@
 mod errors;
 
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blockchain::transaction::Transaction;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -15,6 +16,8 @@ use crate::errors::ClientError;
 /// par lots de `BATCH_SIZE`, avec `CONCURRENCY` tâches en parallèle, puis affiche
 /// le TPS côté client et `GET /metrics` de chaque node de `METRICS_URLS`
 /// (séparées par des virgules).
+/// Pendant l'envoi : une ligne de progression par seconde, et chaque nouveau
+/// motif de rejet ou erreur HTTP est affiché dès qu'il apparaît.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::from_env(|name| std::env::var(name).ok())?;
@@ -27,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         config.tx_count, config.node_url, config.concurrency, config.batch_size
     );
     let started = Instant::now();
+    let progress = tokio::spawn(report_progress(Arc::clone(&counters), started));
     let handles: Vec<_> = split_work(config.tx_count, config.concurrency)
         .into_iter()
         .map(|count| {
@@ -34,21 +38,36 @@ async fn main() -> anyhow::Result<()> {
             let url = format!("{}/transactions", config.node_url);
             let batch_size = config.batch_size;
             let counters = Arc::clone(&counters);
-            tokio::spawn(
-                async move { spam(client, url, recipient, count, batch_size, counters).await },
-            )
+            tokio::spawn(async move {
+                let result = spam(
+                    client, url, recipient, count, batch_size, &counters, started,
+                )
+                .await;
+                if let Err(err) = result {
+                    counters.failed_workers.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[{:.1}s] worker stopped: {err}",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+            })
         })
         .collect();
     for handle in handles {
-        if let Err(err) = handle.await? {
-            eprintln!("worker stopped: {err}");
-        }
+        handle.await?;
     }
+    progress.abort();
     let elapsed = started.elapsed().as_secs_f64();
 
     let accepted = counters.accepted.load(Ordering::Relaxed);
     let rejected = counters.rejected.load(Ordering::Relaxed);
-    println!("accepted: {accepted}, rejected: {rejected}, elapsed: {elapsed:.2}s");
+    let failed_workers = counters.failed_workers.load(Ordering::Relaxed);
+    println!(
+        "accepted: {accepted}, rejected: {rejected}, failed workers: {failed_workers}, elapsed: {elapsed:.2}s"
+    );
+    for (kind, count) in counters.rejections() {
+        println!("  rejected {count}x: {kind}");
+    }
     println!(
         "client TPS: {:.0}",
         accepted as f64 / elapsed.max(f64::EPSILON)
@@ -123,12 +142,72 @@ fn parse_number(
 struct Counters {
     accepted: AtomicU64,
     rejected: AtomicU64,
+    failed_workers: AtomicU64,
+    /// Nombre de rejets par motif (voir `error_kind`).
+    rejections: Mutex<HashMap<String, u64>>,
+}
+
+impl Counters {
+    /// Compte le rejet ; un motif encore jamais vu est affiché tout de suite.
+    fn record_rejection(&self, error: &str, started: Instant) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let kind = error_kind(error);
+        let mut rejections = self.rejections.lock().unwrap_or_else(|e| e.into_inner());
+        let count = rejections.entry(kind.to_owned()).or_default();
+        if *count == 0 {
+            eprintln!(
+                "[{:.1}s] new rejection: {error}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        *count += 1;
+    }
+
+    fn rejections(&self) -> Vec<(String, u64)> {
+        let rejections = self.rejections.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rejections: Vec<_> = rejections.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        rejections.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        rejections
+    }
+}
+
+/// Motif d'un rejet sans le hash de TX final, pour regrouper les rejets
+/// (`"transaction already seen: <hash>"` → `"transaction already seen"`).
+fn error_kind(error: &str) -> &str {
+    match error.rsplit_once(": ") {
+        Some((kind, hash))
+            if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            kind
+        }
+        _ => error,
+    }
+}
+
+/// Une ligne par seconde : totaux et débit sur la dernière seconde.
+async fn report_progress(counters: Arc<Counters>, started: Instant) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.tick().await;
+    let mut previous = 0;
+    loop {
+        ticker.tick().await;
+        let accepted = counters.accepted.load(Ordering::Relaxed);
+        println!(
+            "[{:.0}s] accepted {accepted} (+{}/s), rejected {}, failed workers {}",
+            started.elapsed().as_secs_f64(),
+            accepted - previous,
+            counters.rejected.load(Ordering::Relaxed),
+            counters.failed_workers.load(Ordering::Relaxed),
+        );
+        previous = accepted;
+    }
 }
 
 /// Réponse de `POST /transactions` : une entrée par TX, dans le même ordre.
 #[derive(Deserialize)]
 struct TransactionResult {
     status: TransactionStatus,
+    error: Option<String>,
 }
 
 #[derive(Deserialize, Debug, PartialEq)]
@@ -146,12 +225,13 @@ async fn spam(
     recipient: VerifyingKey,
     count: u64,
     batch_size: u64,
-    counters: Arc<Counters>,
+    counters: &Counters,
+    started: Instant,
 ) -> Result<(), ClientError> {
     let sender = random_key()?;
     for nonces in nonce_batches(count, batch_size) {
         let batch = nonces
-            .map(|nonce| Transaction::new(&recipient, 1, nonce, unix_secs(), &sender))
+            .map(|nonce| Transaction::new(&recipient, 1, nonce, unix_millis(), &sender))
             .collect::<Result<Vec<_>, _>>()?;
         let results: Vec<TransactionResult> = client
             .post(&url)
@@ -162,11 +242,13 @@ async fn spam(
             .json()
             .await?;
         for result in results {
-            let counter = match result.status {
-                TransactionStatus::Accepted => &counters.accepted,
-                TransactionStatus::Rejected => &counters.rejected,
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
+            match result.status {
+                TransactionStatus::Accepted => {
+                    counters.accepted.fetch_add(1, Ordering::Relaxed);
+                }
+                TransactionStatus::Rejected => counters
+                    .record_rejection(result.error.as_deref().unwrap_or("unknown error"), started),
+            }
         }
     }
     Ok(())
@@ -201,10 +283,10 @@ fn random_key() -> Result<SigningKey, ClientError> {
     Ok(SigningKey::from_bytes(&secret))
 }
 
-fn unix_secs() -> u64 {
+fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -294,6 +376,29 @@ mod tests {
     }
 
     #[test]
+    fn rejections_are_grouped_without_the_hash() {
+        let hash = "ab".repeat(32);
+        assert_eq!(
+            error_kind(&format!("transaction already seen: {hash}")),
+            "transaction already seen"
+        );
+        assert_eq!(
+            error_kind("invalid transaction: invalid transaction signature"),
+            "invalid transaction: invalid transaction signature"
+        );
+
+        let counters = Counters::default();
+        for _ in 0..3 {
+            counters.record_rejection(&format!("transaction already seen: {hash}"), Instant::now());
+        }
+        assert_eq!(counters.rejected.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            counters.rejections(),
+            [("transaction already seen".to_string(), 3)]
+        );
+    }
+
+    #[test]
     fn work_is_split_without_loss() {
         assert_eq!(split_work(10, 3), [4, 3, 3]);
         assert_eq!(split_work(2, 5), [1, 1]);
@@ -304,7 +409,7 @@ mod tests {
     fn random_keys_sign_valid_transactions() {
         let sender = random_key().unwrap();
         assert_ne!(sender.to_bytes(), random_key().unwrap().to_bytes());
-        let tx = Transaction::new(&sender.verifying_key(), 1, 0, unix_secs(), &sender).unwrap();
+        let tx = Transaction::new(&sender.verifying_key(), 1, 0, unix_millis(), &sender).unwrap();
         tx.verify().unwrap();
     }
 }

@@ -25,7 +25,8 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Creates a signed transaction. Timestamp is supplied in Unix seconds.
+    /// Creates a signed transaction. Timestamp is supplied in Unix milliseconds
+    /// (only used to measure latencies).
     /// The sender is derived from the signing key to prevent key mismatches.
     pub fn new(
         to: &VerifyingKey,
