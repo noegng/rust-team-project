@@ -15,7 +15,7 @@ use axum::{
     routing::{any, post},
 };
 use blockchain::{block::Block, chain::Chain, mempool::Mempool, transaction::Transaction};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
@@ -31,12 +31,27 @@ pub enum NodeMessage {
     Ping,
 }
 
-fn load_signing_key() -> Result<SigningKey, ()> {
-    todo!();
+fn load_signing_key() -> anyhow::Result<SigningKey> {
+    let encoded = std::env::var("SECRET_KEY").expect("qsdqsdd");
+    let mut secret = [0u8; 32];
+    hex::decode_to_slice(encoded.trim(), &mut secret)?;
+
+    Ok(SigningKey::from_bytes(&secret))
 }
 
-fn load_authorized_validators() -> Result<Vec<VerifyingKey>, ()> {
-    todo!();
+fn load_authorized_validators() -> anyhow::Result<Vec<VerifyingKey>> {
+    let encoded = std::env::var("AUTHORIZED_VALIDATORS")?;
+
+    let validators = encoded
+        .split(',')
+        .map(|value| {
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(value.trim(), &mut bytes)?;
+            Ok(VerifyingKey::from_bytes(&bytes)?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(validators)
 }
 
 struct NodeState {
@@ -48,6 +63,11 @@ struct NodeState {
 
 #[tokio::main]
 async fn main() {
+    let signing_key = load_signing_key().unwrap();
+    let public_key = signing_key.verifying_key();
+
+    println!("Public key: {}", hex::encode(public_key.to_bytes()));
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
