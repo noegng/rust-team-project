@@ -4,8 +4,6 @@ use sha2::{Digest, Sha256};
 
 use crate::transaction::Transaction;
 
-pub type PublicKey = [u8; 32];
-
 #[derive(Debug, thiserror::Error)]
 pub enum BlockError {
     #[error("could not serialize block data: {0}")]

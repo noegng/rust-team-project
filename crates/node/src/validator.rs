@@ -9,8 +9,8 @@ use blockchain::{
 use ed25519_dalek::SigningKey;
 use tokio::sync::{Mutex, mpsc};
 
+use crate::NodeMessage;
 use crate::metrics::Metrics;
-use crate::p2p::Message;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ValidatorError {
@@ -34,7 +34,7 @@ pub(crate) struct Validator {
     pub mempool: Arc<Mutex<Mempool>>,
     pub metrics: Arc<Metrics>,
     /// Blocs produits à diffuser aux peers.
-    pub outbound: mpsc::Sender<Message>,
+    pub outbound: mpsc::Sender<NodeMessage>,
     pub block_time: Duration,
 }
 
@@ -56,7 +56,7 @@ impl Validator {
                 Ok(Some(block)) => {
                     self.metrics.record_block(&block);
                     self.outbound
-                        .send(Message::NewBlock(block))
+                        .send(NodeMessage::NewBlock(block))
                         .await
                         .map_err(|_| ValidatorError::ChannelClosed)?;
                 }
