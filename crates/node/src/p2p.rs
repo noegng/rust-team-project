@@ -3,6 +3,7 @@ use std::{fmt::Display, sync::Arc, time::Duration};
 use axum::extract::ws::Message as AxumMessage;
 use blockchain::mempool::MempoolError;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use tokio::sync::broadcast::error::RecvError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use crate::{NodeMessage, NodeState};
@@ -59,7 +60,7 @@ where
     // Read while sending the snapshot, including when both peers replay at once.
     let send = async {
         for block in blocks {
-            let text = serde_json::to_string(&NodeMessage::NewBlock(block))?;
+            let text = serde_json::to_string(&NodeMessage::NewBlock(Box::new(block)))?;
             send_text(&mut writer, text).await?;
         }
         for tx in pending {
@@ -67,10 +68,12 @@ where
             send_text(&mut writer, text).await?;
         }
         loop {
-            // A lagging peer is disconnected and catches up on reconnection.
             match outbound.recv().await {
                 Ok(text) => send_text(&mut writer, text).await?,
-                Err(error) => break Err::<(), _>(anyhow::Error::new(error)),
+                Err(RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "peer gossip lagged");
+                }
+                Err(RecvError::Closed) => break Ok::<(), anyhow::Error>(()),
             }
         }
     };
@@ -96,7 +99,7 @@ where
                 },
                 Ok(NodeMessage::Ping) => {}
                 Ok(NodeMessage::NewBlock(block)) => {
-                    if let Err(error) = state.accept_peer_block(block).await {
+                    if let Err(error) = state.accept_peer_block(*block).await {
                         tracing::warn!(%error, "peer block rejected; reconnect to replay history");
                         break;
                     }

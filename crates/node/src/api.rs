@@ -173,7 +173,7 @@ mod tests {
 
         let submitted: serde_json::Value = client
             .post(format!("{base}/transactions"))
-            .json(&[tx.clone()])
+            .json(std::slice::from_ref(&tx))
             .send()
             .await
             .unwrap()

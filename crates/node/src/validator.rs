@@ -57,10 +57,10 @@ impl NodeState {
     /// Ignore known blocks; reject conflicting history and invalid successors.
     pub(crate) async fn accept_peer_block(&self, block: Block) -> Result<(), ValidatorError> {
         let mut chain = self.chain.lock().await;
-        if let Some(known) = chain.blocks().get(block.block_data.index as usize) {
-            if known.block_data.hash == block.block_data.hash {
-                return Ok(());
-            }
+        if let Some(known) = chain.blocks().get(block.block_data.index as usize)
+            && known.block_data.hash == block.block_data.hash
+        {
+            return Ok(());
         }
         let mut mempool = self.mempool.lock().await;
         accept_block(&mut chain, &mut mempool, &self.metrics, block.clone())?;
@@ -69,11 +69,13 @@ impl NodeState {
     }
 
     fn publish_block(&self, block: Block, action: &str) -> Result<(), ValidatorError> {
-        let text = serde_json::to_string(&NodeMessage::NewBlock(block.clone()))
+        let index = block.block_data.index;
+        let hash = block.block_data.hash.clone();
+        let transactions = block.block_data.transactions.len();
+        let text = serde_json::to_string(&NodeMessage::NewBlock(Box::new(block)))
             .map_err(BlockError::from)?;
         let _ = self.gossip.send(text);
-        tracing::info!(index = block.block_data.index, hash = %block.block_data.hash,
-            transactions = block.block_data.transactions.len(), %action, "block added");
+        tracing::info!(index, %hash, transactions, %action, "block added");
         Ok(())
     }
 }

@@ -4,7 +4,7 @@ mod metrics;
 mod p2p;
 mod validator;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -28,20 +28,51 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[serde(tag = "type", content = "payload")]
 pub enum NodeMessage {
     NewTx(Transaction),
-    NewBlock(Block),
+    /// Boxed: a block is much larger than the other variants.
+    NewBlock(Box<Block>),
     Ping,
 }
 
-fn load_signing_key() -> anyhow::Result<SigningKey> {
-    let encoded = std::env::var("SECRET_KEY")?;
+/// Reads `.env` from the current directory if present; shell variables keep priority.
+fn read_dotenv() -> HashMap<String, String> {
+    let Ok(contents) = std::fs::read_to_string(".env") else {
+        return HashMap::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn get_env(dotenv: &HashMap<String, String>, name: &str) -> anyhow::Result<String> {
+    if let Ok(value) = std::env::var(name) {
+        return Ok(value);
+    }
+    dotenv
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing environment variable {name}"))
+}
+
+fn load_signing_key(dotenv: &HashMap<String, String>) -> anyhow::Result<SigningKey> {
+    let encoded = get_env(dotenv, "SECRET_KEY")?;
     let mut secret = [0u8; 32];
     hex::decode_to_slice(encoded.trim(), &mut secret)?;
 
     Ok(SigningKey::from_bytes(&secret))
 }
 
-fn load_authorized_validators() -> anyhow::Result<Vec<VerifyingKey>> {
-    let encoded = std::env::var("AUTHORIZED_VALIDATORS")?;
+fn load_authorized_validators(
+    dotenv: &HashMap<String, String>,
+) -> anyhow::Result<Vec<VerifyingKey>> {
+    let encoded = get_env(dotenv, "AUTHORIZED_VALIDATORS")?;
 
     let validators = encoded
         .split(',')
@@ -120,10 +151,11 @@ fn app(state: Arc<NodeState>) -> Router {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let signing_key = load_signing_key()?;
+    let dotenv = read_dotenv();
+    let signing_key = load_signing_key(&dotenv)?;
     let public_key = signing_key.verifying_key();
 
-    println!("Public key: {}", hex::encode(public_key.to_bytes()));
+    println!("node public key: {}", hex::encode(public_key.to_bytes()));
 
     tracing_subscriber::registry()
         .with(
@@ -134,24 +166,21 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let authorized_validators = load_authorized_validators()?;
+    let authorized_validators = load_authorized_validators(&dotenv)?;
     let state = Arc::new(NodeState::new(signing_key, authorized_validators)?);
-    let block_time: u64 = std::env::var("BLOCK_TIME_SECS")
+    let block_time: u64 = get_env(&dotenv, "BLOCK_TIME_SECS")
         .unwrap_or_else(|_| "2".into())
         .parse()?;
     anyhow::ensure!(block_time > 0, "BLOCK_TIME_SECS must be greater than zero");
     let app = app(Arc::clone(&state));
 
     // run it with hyper
-    let port: u16 = std::env::var("PORT")
+    let port: u16 = get_env(&dotenv, "PORT")
         .unwrap_or_else(|_| "3000".into())
-        .parse()
-        .expect("PORT must be a valid port number");
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
-        .await
-        .unwrap();
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
-    let port = listener.local_addr().unwrap().port();
+        .parse()?;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await?;
+    let port = listener.local_addr()?.port();
+    tracing::debug!("listening on port {port}");
     let node_id = format!(
         "{:x}-{:x}",
         std::time::SystemTime::now()

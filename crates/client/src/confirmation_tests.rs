@@ -215,7 +215,7 @@ async fn global_deadline_also_cancels_an_unresponsive_request() {
     let hashes = [tx(0).calculate_hash().unwrap()].into_iter().collect();
     let report = wait_for_confirmations(
         &client(),
-        &[node.url.clone()],
+        std::slice::from_ref(&node.url),
         &hashes,
         Duration::from_millis(80),
         Duration::from_millis(5),
@@ -235,7 +235,7 @@ async fn tampered_block_cannot_confirm_a_transaction() {
     let hashes = [tx(0).calculate_hash().unwrap()].into_iter().collect();
     let result = wait_for_confirmations(
         &client(),
-        &[node.url.clone()],
+        std::slice::from_ref(&node.url),
         &hashes,
         Duration::from_secs(2),
         Duration::from_millis(5),
@@ -249,7 +249,7 @@ async fn zero_accepted_transactions_do_not_poll_nodes() {
     let node = start(Vec::new(), Mode::Hang).await;
     let report = wait_for_confirmations(
         &client(),
-        &[node.url.clone()],
+        std::slice::from_ref(&node.url),
         &HashSet::new(),
         Duration::from_secs(1),
         Duration::from_millis(5),

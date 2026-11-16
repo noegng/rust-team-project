@@ -63,9 +63,9 @@ async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>) {
                 continue;
             };
 
-            println!("Connected to peer: {url}");
+            tracing::info!("connected to peer: {url}");
             p2p::handle_peer(socket, Arc::clone(&state)).await;
-            println!("Peer disconnected: {url}");
+            tracing::info!("peer disconnected: {url}");
             break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
