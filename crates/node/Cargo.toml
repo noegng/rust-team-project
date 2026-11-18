@@ -30,6 +30,10 @@ testnet = ["dep:reqwest"]
 reqwest = { version = "0.13.5", features = ["json"] }
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 
+[[test]]
+name = "network"
+required-features = ["testnet"]
+
 [[bench]]
 name = "network"
 harness = false
