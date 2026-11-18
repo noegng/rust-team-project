@@ -104,7 +104,7 @@ fn tx(nonce: u64) -> Transaction {
 
 fn blocks(batches: Vec<Vec<Transaction>>) -> Vec<Block> {
     let key = SigningKey::from_bytes(&[1; 32]);
-    let mut previous = genesis_block().block_data.hash;
+    let mut previous = genesis_block().unwrap().block_data.hash;
     batches
         .into_iter()
         .enumerate()
@@ -168,7 +168,7 @@ async fn matching_inclusion_is_required_even_if_both_nodes_include_the_hash() {
     let mut fork = history.clone();
     fork[0] = Block::new(
         1,
-        genesis_block().block_data.hash,
+        genesis_block().unwrap().block_data.hash,
         vec![tx(0)],
         99,
         &SigningKey::from_bytes(&[1; 32]),

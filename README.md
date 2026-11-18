@@ -395,9 +395,15 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 ## Tests
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo test --workspace --all-features          # tests unitaires + test d'intégration
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all --check
 ```
+
+Le test d'intégration `crates/node/tests/network.rs` rejoue la démo finale par
+l'API publique : 3 validateurs, 500 TX envoyées au node A, puis vérification
+que les 3 nodes ont la même chaîne, toutes les TX incluses et un mempool vide.
+Il a besoin de la feature `testnet` (d'où `--all-features`).
 
 ## Benchmark réseau (Criterion)
 

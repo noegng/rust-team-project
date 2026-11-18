@@ -55,7 +55,10 @@ pub enum ChainError {
 type Nonces = HashMap<Vec<u8>, u64>;
 
 pub struct Chain {
+    /// Toujours non vide : commence par le genesis.
     blocks: Vec<Block>,
+    /// Copie du genesis : `last()` reste total sans `expect`.
+    genesis: Block,
     validators: Vec<VerifyingKey>,
     nonces: Nonces,
 }
@@ -68,8 +71,10 @@ impl Chain {
         if validators.is_empty() {
             return Err(ChainError::NoValidators);
         }
+        let genesis = genesis_block()?;
         Ok(Self {
-            blocks: vec![genesis_block()],
+            blocks: vec![genesis.clone()],
+            genesis,
             validators,
             nonces: Nonces::new(),
         })
@@ -95,7 +100,7 @@ impl Chain {
 
     /// Dernier bloc. Le genesis est toujours présent (`blocks` est privé).
     pub fn last(&self) -> &Block {
-        self.blocks.last().expect("chain always contains genesis")
+        self.blocks.last().unwrap_or(&self.genesis)
     }
 
     /// Validateur attendu pour le bloc `index` (round-robin).
@@ -212,13 +217,12 @@ impl Chain {
 }
 
 /// Bloc 0, identique sur tous les nodes (pas de validateur ni de signature).
-pub fn genesis_block() -> Block {
+pub fn genesis_block() -> Result<Block, BlockError> {
     let mut block = Block {
         block_data: BlockData {
             index: 0,
             prev_hash: GENESIS_PREV_HASH.to_string(),
-            tx_root: Block::calculate_tx_root(&[])
-                .expect("empty transaction list can be serialized"),
+            tx_root: Block::calculate_tx_root(&[])?,
             timestamp: 0,
             hash: String::new(),
             transactions: Vec::new(),
@@ -226,10 +230,8 @@ pub fn genesis_block() -> Block {
         validator: None,
         signature: None,
     };
-    block.block_data.hash = block
-        .calculate_hash()
-        .expect("fixed genesis payload can be serialized");
-    block
+    block.block_data.hash = block.calculate_hash()?;
+    Ok(block)
 }
 
 #[cfg(test)]
@@ -268,8 +270,11 @@ mod tests {
 
     #[test]
     fn genesis_is_deterministic_and_unsigned() {
-        let genesis = genesis_block();
-        assert_eq!(genesis.block_data.hash, genesis_block().block_data.hash);
+        let genesis = genesis_block().unwrap();
+        assert_eq!(
+            genesis.block_data.hash,
+            genesis_block().unwrap().block_data.hash
+        );
         assert_eq!(genesis.block_data.hash.len(), 64);
         assert!(genesis.validator.is_none());
         assert!(genesis.signature.is_none());
@@ -453,7 +458,9 @@ mod tests {
         // Only a caller that verified the TX itself may trust it.
         let mut trusting = chain();
         trusting
-            .push_trusted(next_block(&trusting, vec![forged.clone()], &key(7)), |_| true)
+            .push_trusted(next_block(&trusting, vec![forged.clone()], &key(7)), |_| {
+                true
+            })
             .unwrap();
         let mut strict = chain();
         assert!(matches!(
