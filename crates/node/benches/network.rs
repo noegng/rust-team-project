@@ -40,6 +40,8 @@ const STRESS_START_TPS: f64 = 5_000.0;
 const STRESS_GROWTH: f64 = 1.5;
 const STRESS_MAX_STEPS: usize = 12;
 const MAX_ERROR_RATE: f64 = 0.01;
+/// Measured runs per ramp step (1 with `--test`).
+const STRESS_RUNS: usize = 3;
 
 /// `DASHBOARD_PORT=3200`: every network listens on 3200.. so one browser tab
 /// on the printed dashboard URL follows all runs live.
@@ -338,40 +340,24 @@ fn run_errors(run: &Run) -> u64 {
 
 /// Raises the offered TX/s step by step and stops after the first step whose
 /// error rate (rejected + failed + lost) exceeds MAX_ERROR_RATE.
-fn bench_stress(c: &mut Criterion, runtime: &Runtime) {
-    let mut group = c.benchmark_group("stress");
-    group
-        .sampling_mode(SamplingMode::Flat)
-        .sample_size(10)
-        .measurement_time(Duration::from_secs(30));
+///
+/// Runs outside Criterion: its sampler needs at least 10 samples plus a warm-up
+/// per step (~20 runs of up to 7 s each); `runs` (STRESS_RUNS) is enough here.
+fn run_stress_ramp(runtime: &Runtime, runs: usize) {
     let mut offered = STRESS_START_TPS;
     for _ in 0..STRESS_MAX_STEPS {
         let tps = offered.round() as u64;
         let id = format!("stress/ramp/{tps:06}");
-        let per_sender = (offered / STRESS_SENDERS as f64 * STRESS_STEP.as_secs_f64()).round();
-        group.throughput(Throughput::Elements(per_sender as u64 * STRESS_SENDERS));
-        group.bench_function(BenchmarkId::new("ramp", tps), |b| {
-            b.to_async(runtime).iter_custom(|iters| {
-                let id = id.clone();
-                async move {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        let run = stress_step(offered).await;
-                        total += run.sync;
-                        record(&id, run);
-                    }
-                    total
-                }
-            });
-        });
-        let Some(error_rate) = RUNS
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|runs| run_error_rate(runs))
-        else {
-            break; // Filtered out by the command line: no ramp to follow.
-        };
+        for run in 1..=runs {
+            let result = runtime.block_on(stress_step(offered));
+            println!(
+                "stress: {tps} TX/s, run {run}/{runs}: sync {:.0} ms, error rate {:.3}%",
+                millis(result.sync),
+                run_error_rate(std::slice::from_ref(&result)) * 100.0
+            );
+            record(&id, result);
+        }
+        let error_rate = run_error_rate(&RUNS.lock().unwrap()[&id]);
         println!(
             "stress: offered {tps} TX/s -> error rate {:.3}%",
             error_rate * 100.0
@@ -385,7 +371,46 @@ fn bench_stress(c: &mut Criterion, runtime: &Runtime) {
         }
         offered *= STRESS_GROWTH;
     }
-    group.finish();
+}
+
+/// Runs per ramp step for this command line, or `None` when it excludes the
+/// ramp: `-- stress` (or no filter) runs it, `--test` does 1 run per step.
+fn stress_runs() -> Option<usize> {
+    // Criterion options followed by a value, which is not a filter.
+    const WITH_VALUE: [&str; 14] = [
+        "--save-baseline",
+        "--baseline",
+        "--baseline-lenient",
+        "--load-baseline",
+        "--profile-time",
+        "--measurement-time",
+        "--warm-up-time",
+        "--sample-size",
+        "--noise-threshold",
+        "--confidence-level",
+        "--significance-level",
+        "--nresamples",
+        "--output-format",
+        "--plotting-backend",
+    ];
+    let mut args = std::env::args().skip(1);
+    let (mut filters, mut test) = (Vec::new(), false);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--list" => return None,
+            "--test" => test = true,
+            flag if WITH_VALUE.contains(&flag) => {
+                args.next();
+            }
+            flag if flag.starts_with('-') => {}
+            filter => filters.push(filter.to_string()),
+        }
+    }
+    let selected = filters.is_empty()
+        || filters
+            .iter()
+            .any(|f| "stress/ramp".contains(f.as_str()) || f.contains("stress"));
+    selected.then_some(if test { 1 } else { STRESS_RUNS })
 }
 
 #[derive(Serialize)]
@@ -541,7 +566,9 @@ fn main() {
     bench_sync(&mut criterion, &runtime);
     bench_bad_sync(&mut criterion, &runtime);
     bench_catch_up(&mut criterion, &runtime);
-    bench_stress(&mut criterion, &runtime);
     criterion.final_summary();
+    if let Some(runs) = stress_runs() {
+        run_stress_ramp(&runtime, runs);
+    }
     print_report();
 }
