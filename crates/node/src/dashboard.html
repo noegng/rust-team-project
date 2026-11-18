@@ -27,6 +27,7 @@
     --mp-later: #c98500;
     --mp-gap: #c8432f;
     /* Étapes du traitement d'un bloc. */
+    --step-verify: #b8901c;
     --step-lock: #a3a29b;
     --step-validate: #6a5acd;
     --step-publish: #1f9bb0;
@@ -49,7 +50,9 @@
       --mp-next: #8aa83a;
       --mp-later: #d69a1c;
       --mp-gap: #e0604a;
-      --step-lock: #6f6e69;
+      --step-verify: #d4ad3c;
+      --step-verify: #d4ad3c;
+    --step-lock: #6f6e69;
       --step-validate: #8f80e6;
       --step-publish: #35b4c8;
     }
@@ -71,6 +74,7 @@
     --mp-next: #8aa83a;
     --mp-later: #d69a1c;
     --mp-gap: #e0604a;
+    --step-verify: #d4ad3c;
     --step-lock: #6f6e69;
     --step-validate: #8f80e6;
     --step-publish: #35b4c8;
@@ -202,6 +206,7 @@
     <h2>Temps de traitement des blocs, par node</h2>
     <div class="tabs" id="timing-tabs" role="group" aria-label="Node affiché"></div>
     <div class="legend">
+      <span><span class="key" style="background: var(--step-verify)"></span>Signatures (en parallèle, hors verrous)</span>
       <span><span class="key" style="background: var(--step-lock)"></span>Attente du verrou</span>
       <span><span class="key" style="background: var(--step-validate)"></span>Validation (ou construction)</span>
       <span><span class="key" style="background: var(--step-publish)"></span>Sérialisation et envoi</span>
@@ -906,6 +911,7 @@ function showMempoolTip(node) {
 const timingChart = document.getElementById("timing-chart");
 const timingTooltip = document.getElementById("timing-tooltip");
 const STEPS = [
+  { key: "verify_us", color: "var(--step-verify)", text: "Signatures, hors verrous" },
   { key: "lock_wait_us", color: "var(--step-lock)", text: "Attente du verrou" },
   { key: "validate_us", color: "var(--step-validate)", text: "Validation" },
   { key: "publish_us", color: "var(--step-publish)", text: "Sérialisation et envoi" },
@@ -913,7 +919,8 @@ const STEPS = [
 let timingNodeId = null;
 let hoverTiming = null;
 
-const totalUs = (timing) => timing.lock_wait_us + timing.validate_us + timing.publish_us;
+// `verify_us` absent sur un node pas encore mis à jour.
+const totalUs = (timing) => (timing.verify_us ?? 0) + timing.lock_wait_us + timing.validate_us + timing.publish_us;
 const fmtMs = (us) => `${us < 10_000 ? fmtAxis.format(us / 1000) : fmt.format(us / 1000)} ms`;
 const fmtSec = (ms) => `${fmtAxis.format(ms / 1000)} s`;
 
@@ -955,7 +962,7 @@ function blockCauses(block, node) {
   const heavy = (us) => us > 5_000 && us > 0.4 * total;
   const causes = [];
   if (t.signatures_checked > 0) {
-    causes.push(`${fmt.format(t.signatures_checked)} signatures vérifiées à l'arrivée : ces TX n'étaient pas encore parvenues par gossip`);
+    causes.push(`${fmt.format(t.signatures_checked)} signatures vérifiées à l'arrivée (${fmtMs(t.verify_us ?? t.validate_us)}) : ces TX n'étaient pas encore parvenues par gossip`);
   } else if (heavy(t.validate_us)) {
     causes.push(t.source === "produced"
       ? `${fmtMs(t.validate_us)} pour trier le mempool et construire un bloc de ${fmt.format(t.transactions)} TX`
@@ -1024,7 +1031,7 @@ function drawTiming() {
     }
     let top = bottom;
     for (const step of STEPS) {
-      const segment = h(block.timing[step.key]);
+      const segment = h(block.timing[step.key] ?? 0);
       if (segment <= 0) continue;
       top -= segment;
       // 1 px d'écart entre segments, au-dessus d'une hauteur lisible.
@@ -1059,7 +1066,7 @@ function drawTiming() {
       key.className = "key";
       key.style.background = step.color;
       const value = document.createElement("strong");
-      value.textContent = fmtMs(t[step.key]);
+      value.textContent = fmtMs(t[step.key] ?? 0);
       split.append(key, document.createTextNode(step.key === "validate_us" && t.source === "produced" ? "Construction" : step.text), value);
     }
     const children = [title, split];

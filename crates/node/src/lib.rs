@@ -47,6 +47,13 @@ pub enum NodeMessage {
     Hello(String),
 }
 
+/// Borrowed `NodeMessage::NewBlock`: the same JSON, without cloning a large block.
+#[derive(Serialize)]
+#[serde(tag = "type", content = "payload")]
+enum NodeMessageRef<'a> {
+    NewBlock(&'a Block),
+}
+
 struct NodeState {
     chain: Mutex<Chain>,
     mempool: Mutex<Mempool>,

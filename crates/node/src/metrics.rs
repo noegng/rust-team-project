@@ -20,7 +20,7 @@ pub(crate) enum BlockSource {
 }
 
 /// Coût d'ajout d'un bloc sur ce node, étape par étape (microsecondes).
-/// Les trois étapes se suivent : leur somme est le temps passé sur le bloc.
+/// Les quatre étapes se suivent : leur somme est le temps passé sur le bloc.
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub(crate) struct BlockTiming {
     pub index: u64,
@@ -29,10 +29,13 @@ pub(crate) struct BlockTiming {
     pub added_at_ms: u64,
     /// Écart avec le bloc précédent ajouté par ce node ; `None` pour le premier.
     pub interval_ms: Option<u64>,
+    /// Reçu : hash des TX et vérification de leurs signatures, en parallèle, hors verrous.
+    /// Produit : 0.
+    pub verify_us: u64,
     /// Attente des verrous `chain` puis `mempool` (tenus par l'admission de TX).
     pub lock_wait_us: u64,
     /// Produit : tri du mempool, construction, signature, ajout.
-    /// Reçu : vérification du bloc et de ses TX, ajout, nettoyage du mempool.
+    /// Reçu : vérification du bloc (hashes, signature, nonces), ajout, nettoyage du mempool.
     pub validate_us: u64,
     /// Sérialisation du bloc et envoi aux peers (verrous encore tenus).
     pub publish_us: u64,
@@ -324,6 +327,7 @@ mod tests {
             source: BlockSource::Received,
             added_at_ms,
             interval_ms: Some(999),
+            verify_us: 0,
             lock_wait_us: 1,
             validate_us: 2,
             publish_us: 3,

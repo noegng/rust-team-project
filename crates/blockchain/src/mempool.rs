@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::chain::{Chain, MAX_TXS_PER_BLOCK};
 use crate::transaction::{Transaction, TransactionError, VerifiedTransaction};
@@ -39,8 +39,13 @@ pub struct PendingRun {
 /// Pool des transactions en attente d'inclusion dans un bloc.
 #[derive(Default)]
 pub struct Mempool {
-    pub txs: HashMap<String, Transaction>, // key = tx hash
-    pub seen: HashSet<String>,             // déduplication
+    /// Clé : hash de la TX.
+    txs: HashMap<String, Transaction>,
+    /// Déduplication : TX vérifiées à l'entrée ou incluses dans un bloc accepté.
+    seen: HashSet<String>,
+    /// Les mêmes TX que `txs`, dans l'ordre (expéditeur, nonce, hash) : `drain` ne lit
+    /// que ce qu'il prend, au lieu de trier tout le pool à chaque bloc.
+    by_sender: BTreeMap<Vec<u8>, BTreeSet<(u64, String)>>,
 }
 
 impl Mempool {
@@ -57,7 +62,7 @@ impl Mempool {
         }
         tx.verify()?;
         self.seen.insert(hash.clone());
-        self.txs.insert(hash.clone(), tx);
+        self.insert(hash.clone(), tx);
         Ok(hash)
     }
 
@@ -67,8 +72,28 @@ impl Mempool {
         if !self.seen.insert(hash.clone()) {
             return Err(MempoolError::AlreadySeen(hash));
         }
-        self.txs.insert(hash.clone(), tx.transaction().clone());
+        self.insert(hash.clone(), tx.transaction().clone());
         Ok(hash)
+    }
+
+    fn insert(&mut self, hash: String, tx: Transaction) {
+        self.by_sender
+            .entry(tx.from.clone())
+            .or_default()
+            .insert((tx.nonce, hash.clone()));
+        self.txs.insert(hash, tx);
+    }
+
+    /// Retire une TX en attente ; `seen` est conservé.
+    fn remove(&mut self, hash: &str) -> Option<Transaction> {
+        let tx = self.txs.remove(hash)?;
+        if let Some(pending) = self.by_sender.get_mut(&tx.from) {
+            pending.remove(&(tx.nonce, hash.to_string()));
+            if pending.is_empty() {
+                self.by_sender.remove(&tx.from);
+            }
+        }
+        Some(tx)
     }
 
     /// Retire du pool les TX incluables dans le prochain bloc de `chain`,
@@ -84,35 +109,35 @@ impl Mempool {
     }
 
     fn drain_up_to(&mut self, chain: &Chain, limit: usize) -> Vec<Transaction> {
-        let mut pending: Vec<_> = self.txs.drain().collect();
-        pending.sort_by(|(hash_a, a), (hash_b, b)| {
-            (&a.from, a.nonce, hash_a).cmp(&(&b.from, b.nonce, hash_b))
-        });
-
-        let mut next_nonces: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut ready = Vec::new();
-        for (hash, tx) in pending {
-            if ready.len() == limit {
-                self.txs.insert(hash, tx);
-                continue;
-            }
-            let next = next_nonces
-                .entry(tx.from.clone())
-                .or_insert_with(|| chain.next_nonce(&tx.from));
-            match tx.nonce.cmp(next) {
-                Ordering::Less => {}
-                Ordering::Equal => {
-                    if let Some(following) = next.checked_add(1) {
-                        *next = following;
-                        ready.push(tx);
-                    }
+        let mut stale = Vec::new();
+        'senders: for (from, pending) in &self.by_sender {
+            let mut next = chain.next_nonce(from);
+            for (nonce, hash) in pending {
+                if ready.len() == limit {
+                    break 'senders;
                 }
-                Ordering::Greater => {
-                    self.txs.insert(hash, tx);
+                match nonce.cmp(&next) {
+                    Ordering::Less => stale.push(hash.clone()),
+                    Ordering::Equal => match next.checked_add(1) {
+                        Some(following) => {
+                            next = following;
+                            ready.push(hash.clone());
+                        }
+                        None => stale.push(hash.clone()),
+                    },
+                    // Trou : les nonces suivants de cet expéditeur attendent aussi.
+                    Ordering::Greater => break,
                 }
             }
         }
+        for hash in &stale {
+            self.remove(hash);
+        }
         ready
+            .iter()
+            .map(|hash| self.remove(hash).expect("indexed transactions are pending"))
+            .collect()
     }
 
     /// Vue du pool par suites de nonces consécutifs d'un même expéditeur,
@@ -123,69 +148,79 @@ impl Mempool {
         self.pending_runs_up_to(chain, MAX_TXS_PER_BLOCK)
     }
 
-    /// Même parcours que `drain_up_to` : même tri, même limite.
+    /// Même parcours que `drain_up_to` : même ordre, même limite.
     fn pending_runs_up_to(&self, chain: &Chain, limit: usize) -> Vec<PendingRun> {
-        let mut pending: Vec<_> = self.txs.iter().collect();
-        pending.sort_by(|(hash_a, a), (hash_b, b)| {
-            (&a.from, a.nonce, hash_a).cmp(&(&b.from, b.nonce, hash_b))
-        });
-
         let mut runs: Vec<PendingRun> = Vec::new();
         let mut included = 0;
-        let mut sender: Option<&[u8]> = None;
-        // Prochain nonce contigu pour l'expéditeur courant, et s'il est encore incluable.
-        let mut next = 0;
-        let mut contiguous = true;
-        for (_, tx) in pending {
-            if sender != Some(tx.from.as_slice()) {
-                sender = Some(&tx.from);
-                next = chain.next_nonce(&tx.from);
-                contiguous = true;
-            }
-            if tx.nonce < next {
-                continue;
-            }
-            let state = if tx.nonce == next && contiguous {
-                if included < limit {
-                    included += 1;
-                    PendingState::NextBlock
+        for (from, pending) in &self.by_sender {
+            // Prochain nonce contigu, et si l'expéditeur est encore incluable.
+            let mut next = chain.next_nonce(from);
+            let mut contiguous = true;
+            let first_run = runs.len();
+            for (nonce, hash) in pending {
+                let nonce = *nonce;
+                if nonce < next {
+                    continue;
+                }
+                let state = if nonce == next && contiguous {
+                    if included < limit {
+                        included += 1;
+                        PendingState::NextBlock
+                    } else {
+                        PendingState::Later
+                    }
                 } else {
-                    PendingState::Later
+                    contiguous = false;
+                    PendingState::Gap
+                };
+                next = nonce.saturating_add(1);
+                let timestamp = self.txs[hash].timestamp;
+                match runs[first_run..].last_mut() {
+                    Some(run)
+                        if run.state == state && run.first_nonce + run.count as u64 == nonce =>
+                    {
+                        run.count += 1;
+                        run.oldest_timestamp = run.oldest_timestamp.min(timestamp);
+                    }
+                    _ => runs.push(PendingRun {
+                        from: from.clone(),
+                        first_nonce: nonce,
+                        count: 1,
+                        state,
+                        oldest_timestamp: timestamp,
+                    }),
                 }
-            } else {
-                contiguous = false;
-                PendingState::Gap
-            };
-            next = tx.nonce.saturating_add(1);
-            match runs.last_mut() {
-                Some(run)
-                    if run.state == state
-                        && run.from == tx.from
-                        && run.first_nonce + run.count as u64 == tx.nonce =>
-                {
-                    run.count += 1;
-                    run.oldest_timestamp = run.oldest_timestamp.min(tx.timestamp);
-                }
-                _ => runs.push(PendingRun {
-                    from: tx.from.clone(),
-                    first_nonce: tx.nonce,
-                    count: 1,
-                    state,
-                    oldest_timestamp: tx.timestamp,
-                }),
             }
         }
         runs
+    }
+
+    /// TX en attente de hash `hash`.
+    pub fn get(&self, hash: &str) -> Option<&Transaction> {
+        self.txs.get(hash)
+    }
+
+    /// TX en attente, dans un ordre quelconque.
+    pub fn transactions(&self) -> impl Iterator<Item = &Transaction> {
+        self.txs.values()
     }
 
     /// Retire les TX incluses dans un bloc reçu d'un autre validateur.
     pub fn remove_included(&mut self, txs: &[Transaction]) -> Result<(), MempoolError> {
         for tx in txs {
             let hash = tx.calculate_hash()?;
-            self.txs.remove(&hash);
+            self.remove(&hash);
             self.seen.insert(hash);
         }
         Ok(())
+    }
+
+    /// Comme `remove_included`, avec les hash déjà calculés des TX du bloc.
+    pub fn remove_hashes(&mut self, hashes: &[String]) {
+        for hash in hashes {
+            self.remove(hash);
+            self.seen.insert(hash.clone());
+        }
     }
 
     pub fn contains(&self, hash: &str) -> bool {
@@ -338,6 +373,31 @@ mod tests {
         chain.push(block).unwrap();
         assert_eq!(chain.next_nonce(&tx_from(5, 0, 0).from), 2);
         assert_eq!(chain.next_nonce(&tx_from(7, 0, 0).from), 3);
+    }
+
+    #[test]
+    fn sender_index_follows_every_removal() {
+        let chain = chain();
+        let mut mempool = Mempool::new();
+        let txs: Vec<_> = (0..4).map(|nonce| tx_from(7, 7, nonce)).collect();
+        for tx in &txs {
+            mempool.add(tx.clone()).unwrap();
+        }
+        mempool.add(tx_from(5, 5, 0)).unwrap();
+        // Inclus par un autre validateur : ni rendu par drain, ni laissé dans l'index.
+        mempool.remove_included(&txs[..2]).unwrap();
+        let hash = txs[2].calculate_hash().unwrap();
+        mempool.remove_hashes(std::slice::from_ref(&hash));
+        assert!(mempool.get(&hash).is_none());
+        assert_eq!(mempool.len(), 2);
+        assert_eq!(mempool.by_sender.values().map(BTreeSet::len).sum::<usize>(), 2);
+
+        // Le nonce 3 de l'expéditeur 7 attend les nonces 0 à 2 sur la chaîne.
+        assert_eq!(nonces(&mempool.drain(&chain)), [(5, 0)]);
+        assert_eq!(mempool.len(), 1);
+        mempool.remove_included(&txs[3..]).unwrap();
+        assert!(mempool.is_empty());
+        assert!(mempool.by_sender.is_empty());
     }
 
     #[test]

@@ -229,7 +229,7 @@ pub(crate) async fn get_transaction(
             }
         }
     }
-    match mempool.txs.get(&hash) {
+    match mempool.get(&hash) {
         Some(tx) => Ok(Json(TransactionStatus::Pending {
             hash,
             transaction: tx.clone(),

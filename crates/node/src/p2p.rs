@@ -96,7 +96,7 @@ where
         let mempool = state.mempool.lock().await;
         (
             chain.blocks().iter().skip(1).cloned().collect(),
-            mempool.txs.values().cloned().collect(),
+            mempool.transactions().cloned().collect(),
         )
     };
     tracing::info!(
@@ -403,10 +403,10 @@ mod tests {
         wait_for_pool(&states, 12).await;
         for state in &states {
             let pool = state.mempool.lock().await;
-            assert!(pool.txs.contains_key(&first_hash));
-            assert!(pool.txs.contains_key(&reverse_hash));
+            assert!(pool.get(&first_hash).is_some());
+            assert!(pool.get(&reverse_hash).is_some());
             for tx in &transactions {
-                assert!(pool.txs.contains_key(&tx.calculate_hash().unwrap()));
+                assert!(pool.get(&tx.calculate_hash().unwrap()).is_some());
             }
         }
 
@@ -436,8 +436,8 @@ mod tests {
                     .mempool
                     .lock()
                     .await
-                    .txs
-                    .contains_key(&transaction(12).calculate_hash().unwrap())
+                    .get(&transaction(12).calculate_hash().unwrap())
+                    .is_some()
             );
         }
     }

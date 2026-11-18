@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::{BlockSource, BlockTiming, Metrics, unix_millis};
-use crate::{NodeMessage, NodeState};
+use crate::{NodeMessageRef, NodeState, blocking};
 use blockchain::{
     block::{Block, BlockError},
     chain::{Chain, ChainError},
     mempool::{Mempool, MempoolError},
 };
 use ed25519_dalek::SigningKey;
+use rayon::prelude::*;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ValidatorError {
@@ -201,12 +202,13 @@ impl NodeState {
             self.metrics.record_block(&block);
             let (index, transactions) =
                 (block.block_data.index, block.block_data.transactions.len());
-            self.publish_block(block, "produced")?;
+            self.publish_block(&block, "produced")?;
             self.metrics.record_block_timing(BlockTiming {
                 index,
                 source: BlockSource::Produced,
                 added_at_ms: unix_millis(),
                 interval_ms: None,
+                verify_us: 0,
                 lock_wait_us: micros(locked - started),
                 validate_us: micros(built - locked),
                 publish_us: micros(built.elapsed()),
@@ -219,27 +221,48 @@ impl NodeState {
     }
 
     /// Ignore known blocks; reject conflicting history and invalid successors.
+    /// Hashing and signature checks run in parallel before the locks are taken:
+    /// a block of TXs never gossiped to us would otherwise hold them for seconds.
     pub(crate) async fn accept_peer_block(&self, block: Block) -> Result<(), ValidatorError> {
+        if self.knows(&block).await {
+            return Ok(());
+        }
         let started = Instant::now();
+        let (block, hashes) = blocking(move || {
+            let hashes = hash_transactions(&block);
+            (block, hashes)
+        })
+        .await;
+        let hashes = hashes?;
+        let unknown = {
+            let mempool = self.mempool.lock().await;
+            unknown_transactions(&mempool, &hashes)
+        };
+        let checked = blocking(move || CheckedBlock::new(block, hashes, &unknown)).await?;
+        let verified = Instant::now();
+
         let mut chain = self.chain.lock().await;
-        if let Some(known) = chain.blocks().get(block.block_data.index as usize)
-            && known.block_data.hash == block.block_data.hash
-        {
+        // Another peer may have relayed the same block while we were checking it.
+        if is_known(&chain, &checked.block) {
             return Ok(());
         }
         let mut mempool = self.mempool.lock().await;
         let locked = Instant::now();
-        let (index, transactions) = (block.block_data.index, block.block_data.transactions.len());
-        let signatures_checked =
-            accept_block(&mut chain, &mut mempool, &self.metrics, block.clone())?;
+        let (index, transactions, signatures_checked) = (
+            checked.block.block_data.index,
+            checked.block.block_data.transactions.len(),
+            checked.signatures_checked,
+        );
+        accept_block(&mut chain, &mut mempool, &self.metrics, checked)?;
         let validated = Instant::now();
-        self.publish_block(block, "received")?;
+        self.publish_block(chain.last(), "received")?;
         self.metrics.record_block_timing(BlockTiming {
             index,
             source: BlockSource::Received,
             added_at_ms: unix_millis(),
             interval_ms: None,
-            lock_wait_us: micros(locked - started),
+            verify_us: micros(verified - started),
+            lock_wait_us: micros(locked - verified),
             validate_us: micros(validated - locked),
             publish_us: micros(validated.elapsed()),
             signatures_checked,
@@ -248,12 +271,17 @@ impl NodeState {
         Ok(())
     }
 
-    fn publish_block(&self, block: Block, action: &str) -> Result<(), ValidatorError> {
+    async fn knows(&self, block: &Block) -> bool {
+        is_known(&*self.chain.lock().await, block)
+    }
+
+    /// Called with the locks held: blocks reach the peers in chain order.
+    fn publish_block(&self, block: &Block, action: &str) -> Result<(), ValidatorError> {
         let index = block.block_data.index;
-        let hash = block.block_data.hash.clone();
+        let hash = &block.block_data.hash;
         let transactions = block.block_data.transactions.len();
-        let text = serde_json::to_string(&NodeMessage::NewBlock(Box::new(block)))
-            .map_err(BlockError::from)?;
+        let text =
+            serde_json::to_string(&NodeMessageRef::NewBlock(block)).map_err(BlockError::from)?;
         let _ = self.gossip.send(text);
         tracing::info!(index, %hash, transactions, %action, "block added");
         Ok(())
@@ -279,41 +307,96 @@ pub(crate) fn produce_block(
     let transactions = mempool.drain(chain);
     let block = Block::new(index, prev_hash, transactions, timestamp, signing_key)?;
     // Drained from the mempool: every TX was verified on admission.
-    chain.push_trusted(block.clone(), |tx| is_verified(mempool, tx))?;
+    chain.push_trusted(block.clone(), |_| true)?;
     Ok(Some(block))
 }
 
+/// Bloc reçu dont toutes les signatures de TX ont été vérifiées :
+/// soit à l'entrée du mempool, soit par `CheckedBlock::new`.
+pub(crate) struct CheckedBlock {
+    block: Block,
+    /// Hash de chaque TX, dans l'ordre du bloc.
+    hashes: Vec<String>,
+    signatures_checked: usize,
+}
+
+impl CheckedBlock {
+    /// Vérifie en parallèle la signature des TX d'indice `unknown` (absentes du mempool).
+    /// Coûteux : à appeler hors des verrous (`blocking`).
+    pub(crate) fn new(
+        block: Block,
+        hashes: Vec<String>,
+        unknown: &[usize],
+    ) -> Result<Self, ValidatorError> {
+        let txs = &block.block_data.transactions;
+        unknown
+            .par_iter()
+            .try_for_each(|&i| txs[i].verify())
+            .map_err(ChainError::from)?;
+        Ok(Self {
+            signatures_checked: unknown.len(),
+            block,
+            hashes,
+        })
+    }
+
+    /// Pour les tests : hash, tri et vérification d'un coup, mempool en main.
+    #[cfg(test)]
+    fn check(block: Block, mempool: &Mempool) -> Result<Self, ValidatorError> {
+        let hashes = hash_transactions(&block)?;
+        let unknown = unknown_transactions(mempool, &hashes);
+        Self::new(block, hashes, &unknown)
+    }
+}
+
+/// Hash de chaque TX du bloc, en parallèle.
+fn hash_transactions(block: &Block) -> Result<Vec<String>, ValidatorError> {
+    block
+        .block_data
+        .transactions
+        .par_iter()
+        .map(|tx| tx.calculate_hash())
+        .collect::<Result<_, _>>()
+        .map_err(|error| ChainError::from(error).into())
+}
+
+/// Indices des TX dont le mempool n'a pas déjà vérifié la signature.
+/// `seen` ne contient que des TX vérifiées ou incluses dans un bloc accepté.
+fn unknown_transactions(mempool: &Mempool, hashes: &[String]) -> Vec<usize> {
+    hashes
+        .iter()
+        .enumerate()
+        .filter(|(_, hash)| !mempool.contains(hash))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn is_known(chain: &Chain, block: &Block) -> bool {
+    chain
+        .blocks()
+        .get(block.block_data.index as usize)
+        .is_some_and(|known| known.block_data.hash == block.block_data.hash)
+}
+
 /// Bloc reçu d'un peer (`Message::NewBlock`) : validateur autorisé et à son tour,
-/// signature, lien, timestamp et TX sont vérifiés par `Chain::push`.
+/// lien, timestamp, hashes et nonces sont vérifiés par `Chain::push_trusted`,
+/// les signatures de TX l'ont été par `CheckedBlock`.
 /// Les TX incluses sont ensuite retirées du mempool.
-/// Retourne le nombre de signatures de TX vérifiées : celles absentes du mempool.
 pub(crate) fn accept_block(
     chain: &mut Chain,
     mempool: &mut Mempool,
     metrics: &Metrics,
-    block: Block,
-) -> Result<usize, ValidatorError> {
-    let unknown = std::cell::Cell::new(0);
-    chain.push_trusted(block, |tx| {
-        let known = is_verified(mempool, tx);
-        unknown.set(unknown.get() + usize::from(!known));
-        known
-    })?;
-    let block = chain.last();
-    mempool.remove_included(&block.block_data.transactions)?;
-    metrics.record_block(block);
-    Ok(unknown.get())
+    checked: CheckedBlock,
+) -> Result<(), ValidatorError> {
+    let CheckedBlock { block, hashes, .. } = checked;
+    chain.push_trusted(block, |_| true)?;
+    mempool.remove_hashes(&hashes);
+    metrics.record_block(chain.last());
+    Ok(())
 }
 
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-/// Mempool `seen` only holds hashes of TXs that passed `verify` or were
-/// included in an accepted block: their signature need not be checked again.
-fn is_verified(mempool: &Mempool, tx: &blockchain::transaction::Transaction) -> bool {
-    tx.calculate_hash()
-        .is_ok_and(|hash| mempool.contains(&hash))
 }
 
 fn unix_secs() -> u64 {
@@ -325,6 +408,7 @@ fn unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NodeMessage;
     use blockchain::transaction::Transaction;
 
     fn key(seed: u8) -> SigningKey {
@@ -388,7 +472,8 @@ mod tests {
         assert!(producer_mempool.is_empty());
 
         let metrics = Metrics::new();
-        accept_block(&mut peer_chain, &mut peer_mempool, &metrics, block).unwrap();
+        let checked = CheckedBlock::check(block, &peer_mempool).unwrap();
+        accept_block(&mut peer_chain, &mut peer_mempool, &metrics, checked).unwrap();
         assert_eq!(
             peer_chain.last().block_data.hash,
             producer_chain.last().block_data.hash
@@ -410,9 +495,19 @@ mod tests {
 
         let mut peer_mempool = Mempool::new();
         peer_mempool.add(tx(0)).unwrap();
-        let checked =
-            accept_block(&mut chain(), &mut peer_mempool, &Metrics::new(), block).unwrap();
-        assert_eq!(checked, 2);
+        let checked = CheckedBlock::check(block.clone(), &peer_mempool).unwrap();
+        assert_eq!(checked.signatures_checked, 2);
+        accept_block(&mut chain(), &mut peer_mempool, &Metrics::new(), checked).unwrap();
+        assert!(peer_mempool.is_empty());
+        assert!(peer_mempool.contains(&tx(2).calculate_hash().unwrap()));
+
+        // Une TX falsifiée absente du mempool est refusée avant tout verrou.
+        let mut forged = block;
+        forged.block_data.transactions[1].amount += 1;
+        assert!(matches!(
+            CheckedBlock::check(forged, &Mempool::new()),
+            Err(ValidatorError::Chain(ChainError::InvalidTransaction(_)))
+        ));
     }
 
     #[tokio::test]
@@ -465,7 +560,12 @@ mod tests {
         let out_of_turn =
             Block::new(1, chain.last().block_data.hash.clone(), vec![], 10, &key(1)).unwrap();
         assert!(matches!(
-            accept_block(&mut chain, &mut mempool, &metrics, out_of_turn),
+            accept_block(
+                &mut chain,
+                &mut mempool,
+                &metrics,
+                CheckedBlock::check(out_of_turn, &Mempool::new()).unwrap()
+            ),
             Err(ValidatorError::Chain(ChainError::WrongProposer {
                 index: 1
             }))
@@ -473,9 +573,10 @@ mod tests {
 
         let block =
             Block::new(1, chain.last().block_data.hash.clone(), vec![], 10, &key(2)).unwrap();
-        accept_block(&mut chain, &mut mempool, &metrics, block.clone()).unwrap();
+        let check = |block| CheckedBlock::check(block, &Mempool::new()).unwrap();
+        accept_block(&mut chain, &mut mempool, &metrics, check(block.clone())).unwrap();
         assert!(matches!(
-            accept_block(&mut chain, &mut mempool, &metrics, block),
+            accept_block(&mut chain, &mut mempool, &metrics, check(block)),
             Err(ValidatorError::Chain(ChainError::InvalidIndex { .. }))
         ));
         assert_eq!(chain.len(), 2);
@@ -510,10 +611,11 @@ mod tests {
         )
         .unwrap();
         state.accept_peer_block(block.clone()).await.unwrap();
-        assert!(matches!(
-            serde_json::from_str::<NodeMessage>(&events.try_recv().unwrap()).unwrap(),
-            NodeMessage::NewBlock(_)
-        ));
+        // The borrowed encoding is byte-for-byte the owned message.
+        assert_eq!(
+            events.try_recv().unwrap(),
+            serde_json::to_string(&NodeMessage::NewBlock(Box::new(block.clone()))).unwrap()
+        );
         state.accept_peer_block(block).await.unwrap();
         assert!(events.try_recv().is_err());
         assert_eq!(state.chain.lock().await.len(), 2);
