@@ -134,10 +134,7 @@ impl Mempool {
         for hash in &stale {
             self.remove(hash);
         }
-        ready
-            .iter()
-            .map(|hash| self.remove(hash).expect("indexed transactions are pending"))
-            .collect()
+        ready.iter().filter_map(|hash| self.remove(hash)).collect()
     }
 
     /// Vue du pool par suites de nonces consécutifs d'un même expéditeur,
@@ -390,7 +387,10 @@ mod tests {
         mempool.remove_hashes(std::slice::from_ref(&hash));
         assert!(mempool.get(&hash).is_none());
         assert_eq!(mempool.len(), 2);
-        assert_eq!(mempool.by_sender.values().map(BTreeSet::len).sum::<usize>(), 2);
+        assert_eq!(
+            mempool.by_sender.values().map(BTreeSet::len).sum::<usize>(),
+            2
+        );
 
         // Le nonce 3 de l'expéditeur 7 attend les nonces 0 à 2 sur la chaîne.
         assert_eq!(nonces(&mempool.drain(&chain)), [(5, 0)]);
