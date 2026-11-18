@@ -59,11 +59,18 @@ CONFIRM_TIMEOUT_SECS=60 \
 cargo run -p client
 ```
 
-Pour le benchmark à 10 000 TX :
+Pour simuler du trafic en continu (lots et pauses aléatoires) jusqu'à Ctrl+C :
+
+```bash
+cargo run --release -p client
+```
+
+Pour le benchmark à 10 000 TX (débit maximal, sans pause) :
 
 ```bash
 NODE_URL=http://127.0.0.1:3000 \
 METRICS_URLS=http://127.0.0.1:3000,http://127.0.0.1:3001,http://127.0.0.1:3002 \
+TX_COUNT=10000 MIN_BATCH_SIZE=100 MAX_PAUSE_MS=0 \
 cargo run --release -p client
 ```
 
@@ -98,10 +105,13 @@ Les nodes écoutent sur `0.0.0.0` et se découvrent automatiquement via mDNS sur
    ```
    Attendre les messages `connected to peer` / `incoming peer connected` et `block added` sur les 3 machines. (Autoriser le port `3000` si le pare-feu demande confirmation.)
 
-4. **Lancer le client depuis l'un des PC** avec les IP locales des 3 machines (`ipconfig getifaddr en0` sur macOS, `hostname -I` sur Linux, `ipconfig` sur Windows) :
+4. **Lancer le client depuis l'un des PC**. Il envoie les TX au node local (`http://127.0.0.1:3000` par défaut), qui les diffuse aux autres via les blocs :
    ```bash
-   NODE_URL=http://<IP_PC_A>:3000 \
-   METRICS_URLS=http://<IP_PC_A>:3000,http://<IP_PC_B>:3000,http://<IP_PC_C>:3000 \
+   cargo run --release -p client
+   ```
+   Optionnel : pour vérifier que les TX sont incluses sur **les 3 nodes** (et afficher leurs métriques), ajouter leurs IP locales (`ipconfig getifaddr en0` sur macOS, `hostname -I` sur Linux, `ipconfig` sur Windows) :
+   ```bash
+   METRICS_URLS=http://127.0.0.1:3000,http://<IP_PC_B>:3000,http://<IP_PC_C>:3000 \
    cargo run --release -p client
    ```
 
@@ -180,9 +190,11 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `NODE_URL` | `http://127.0.0.1:3000` | Node cible des soumissions |
-| `TX_COUNT` | `10000` | Nombre total de TX à envoyer |
+| `TX_COUNT` | vide (continu) | Nombre total de TX à envoyer, puis attente des confirmations. Vide : envoi jusqu'à Ctrl+C |
 | `CONCURRENCY` | `50` | Nombre de tâches parallèles (1 clé expéditeur chacune) |
-| `BATCH_SIZE` | `100` | Nombre de TX par requête `POST /transactions` |
+| `BATCH_SIZE` | `100` | Taille max d'un lot `POST /transactions` |
+| `MIN_BATCH_SIZE` | `1` | Taille min d'un lot (tirage uniforme jusqu'à `BATCH_SIZE`) |
+| `MAX_PAUSE_MS` | `1000` | Pause aléatoire max avant chaque lot, par tâche (`0` = débit maximal) |
 | `METRICS_URLS` | `NODE_URL` | Liste des nodes où vérifier les confirmations et lire `/metrics` |
 | `CONFIRM_TIMEOUT_SECS` | `60` | Délai max pour la confirmation sur tous les nodes |
 | `POLL_INTERVAL_MS` | `500` | Fréquence de polling des blocs pour la confirmation |
