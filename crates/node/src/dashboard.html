@@ -140,6 +140,14 @@
   </section>
 
   <section class="panel">
+    <h2>TX par bloc (40 derniers blocs, couleur = node producteur)</h2>
+    <div class="chart-wrap">
+      <svg id="blocks-chart" role="img" aria-label="Nombre de TX dans chacun des derniers blocs, coloré par node producteur"></svg>
+      <div class="tooltip" id="blocks-tooltip" role="status"></div>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>Derniers blocs</h2>
     <div class="table-scroll">
       <table>
@@ -172,6 +180,9 @@ const nodes = new Map();
 /** Un relevé par tour : { t, rates: Map(id → TX/s | null) } */
 const history = [];
 let blocks = [];
+/** public_key → node, pour colorer chaque bloc selon son producteur. */
+let blockOwners = new Map();
+const BLOCKS_SHOWN = 40;
 let lastBlockIndex = null;
 let hoverX = null;
 /** Dernière hauteur max vue et depuis quand elle n'a pas bougé. */
@@ -370,15 +381,17 @@ async function refreshBlocks(live) {
   const source = live.find((node) => node.id === "self") || live[0];
   if (!source) return;
   try {
-    blocks = await getJson(`${source.url}/blocks?limit=12`);
+    blocks = await getJson(`${source.url}/blocks?limit=${BLOCKS_SHOWN}`);
   } catch {
     return;
   }
   const owners = new Map(live.map((node) => [node.metrics.public_key, node]));
+  blockOwners = owners;
+  drawBlocks();
   const body = document.getElementById("blocks");
   const now = Date.now() / 1000;
   const newest = blocks[0]?.index ?? null;
-  const rows = blocks.map((block) => {
+  const rows = blocks.slice(0, 12).map((block) => {
     const tr = document.createElement("tr");
     if (lastBlockIndex != null && block.index > lastBlockIndex) tr.className = "fresh";
     const cell = (text, className) => {
@@ -536,6 +549,103 @@ function drawChart() {
     return item;
   }));
 }
+
+// ---- Histogramme : TX par bloc, une barre par bloc, couleur du producteur ----
+
+const blocksChart = document.getElementById("blocks-chart");
+const blocksTooltip = document.getElementById("blocks-tooltip");
+const blocksMargin = { top: 10, right: 16, bottom: 24, left: 52 };
+let hoverBlock = null;
+
+/** Barre ancrée sur l'axe, coins supérieurs arrondis. */
+function barPath(x, y, w, h) {
+  const r = Math.min(4, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+
+function drawBlocks() {
+  const width = blocksChart.clientWidth;
+  const height = blocksChart.clientHeight;
+  const plotW = Math.max(10, width - blocksMargin.left - blocksMargin.right);
+  const plotH = height - blocksMargin.top - blocksMargin.bottom;
+  // Du plus ancien au plus récent ; le plus récent toujours à droite.
+  const series = blocks.filter((block) => block.index > 0).reverse();
+  const yMax = niceMax(Math.max(0, ...series.map((block) => block.transactions)));
+  const slotW = plotW / BLOCKS_SHOWN;
+  const barW = Math.max(1, slotW - 2);
+  const offset = BLOCKS_SHOWN - series.length;
+  const baseline = blocksMargin.top + plotH;
+  const y = (v) => baseline - (v / yMax) * plotH;
+  const slotX = (i) => blocksMargin.left + (offset + i) * slotW + 1;
+
+  const parts = [];
+  for (let i = 0; i <= 4; i++) {
+    const value = (yMax / 4) * i;
+    parts.push(el("line", { x1: blocksMargin.left, x2: blocksMargin.left + plotW, y1: y(value), y2: y(value), stroke: "var(--grid)", "stroke-width": 1 }));
+    parts.push(el("text", { x: blocksMargin.left - 8, y: y(value) + 4, "text-anchor": "end" }, fmtAxis.format(value)));
+  }
+  series.forEach((block, i) => {
+    const owner = blockOwners.get(block.validator);
+    const fill = owner ? `var(--series-${owner.slot})` : "var(--text-muted)";
+    const faded = hoverBlock != null && hoverBlock !== block.index ? 0.45 : 1;
+    if (block.transactions === 0) {
+      // Bloc vide : un trait sur l'axe pour montrer qu'il a bien été produit.
+      parts.push(el("rect", { x: slotX(i), y: baseline - 2, width: barW, height: 2, fill, opacity: 0.6 * faded }));
+    } else {
+      const top = y(block.transactions);
+      parts.push(el("path", { d: barPath(slotX(i), top, barW, Math.max(1, baseline - top)), fill, opacity: faded }));
+    }
+  });
+  // Index du plus ancien, du milieu et du plus récent bloc affiché.
+  const labelled = series.length > 2 ? [0, Math.floor(series.length / 2), series.length - 1] : series.map((_, i) => i);
+  for (const i of labelled) {
+    const anchor = i === series.length - 1 ? "end" : offset + i === 0 ? "start" : "middle";
+    parts.push(el("text", { x: slotX(i) + barW / 2, y: height - 6, "text-anchor": anchor }, `#${series[i].index}`));
+  }
+
+  const hovered = series.findIndex((block) => block.index === hoverBlock);
+  if (hovered >= 0) {
+    const block = series[hovered];
+    const owner = blockOwners.get(block.validator);
+    blocksTooltip.replaceChildren();
+    const title = document.createElement("div");
+    const strong = document.createElement("strong");
+    strong.textContent = `Bloc #${block.index}`;
+    title.append(strong);
+    const row = document.createElement("div");
+    row.className = "row";
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = owner ? `var(--series-${owner.slot})` : "var(--text-muted)";
+    row.append(swatch, document.createTextNode(owner ? label(owner) : `${block.validator.slice(0, 8)}…`));
+    const txs = document.createElement("div");
+    txs.textContent = `${fmt.format(block.transactions)} TX`;
+    const age = document.createElement("div");
+    age.className = "muted";
+    age.textContent = `il y a ${fmt.format(Math.max(0, Date.now() / 1000 - block.timestamp))} s · ${block.hash.slice(0, 12)}…`;
+    blocksTooltip.append(title, row, txs, age);
+    blocksTooltip.style.display = "block";
+    const cx = slotX(hovered) + barW / 2;
+    const left = cx + 12 + blocksTooltip.offsetWidth > width ? cx - 12 - blocksTooltip.offsetWidth : cx + 12;
+    blocksTooltip.style.left = `${Math.max(0, left)}px`;
+    blocksTooltip.style.top = `${blocksMargin.top}px`;
+  } else {
+    blocksTooltip.style.display = "none";
+  }
+  blocksChart.replaceChildren(...parts);
+}
+
+blocksChart.addEventListener("pointermove", (event) => {
+  const box = blocksChart.getBoundingClientRect();
+  const plotW = Math.max(10, box.width - blocksMargin.left - blocksMargin.right);
+  const slot = Math.floor((event.clientX - box.left - blocksMargin.left) / (plotW / BLOCKS_SHOWN));
+  const series = blocks.filter((block) => block.index > 0).reverse();
+  const i = slot - (BLOCKS_SHOWN - series.length);
+  hoverBlock = i >= 0 && i < series.length ? series[i].index : null;
+  drawBlocks();
+});
+blocksChart.addEventListener("pointerleave", () => { hoverBlock = null; drawBlocks(); });
+window.addEventListener("resize", drawBlocks);
 
 chart.addEventListener("pointermove", (event) => {
   const box = chart.getBoundingClientRect();
