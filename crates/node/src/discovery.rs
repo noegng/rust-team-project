@@ -5,6 +5,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use crate::{NodeState, p2p};
 
 const SERVICE_TYPE: &str = "_authora._tcp.local.";
+const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 pub(crate) async fn discover_peers(
     node_id: String,
@@ -54,13 +55,15 @@ pub(crate) async fn discover_peers(
             .into_iter()
             .map(|ip| format!("ws://{ip}:{}/ws", peer.get_port()))
             .collect();
-        tokio::spawn(connect_peer(urls, Arc::clone(&state)));
+        tokio::spawn(connect_peer(urls, Arc::clone(&state), RETRY_DELAY));
     }
 
     Ok(())
 }
 
-async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>) {
+/// Dials `urls` forever: after a disconnect (including a sync reset),
+/// waits `retry` then reconnects, which replays both histories.
+pub(crate) async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>, retry: Duration) {
     loop {
         for url in &urls {
             let Ok(Ok((socket, _))) = tokio::time::timeout(
@@ -77,6 +80,6 @@ async fn connect_peer(urls: Vec<String>, state: Arc<NodeState>) {
             tracing::info!("peer disconnected: {url}");
             break;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(retry).await;
     }
 }

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use crate::chain::Chain;
+use crate::chain::{Chain, MAX_TXS_PER_BLOCK};
 use crate::transaction::{Transaction, TransactionError};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,7 +45,12 @@ impl Mempool {
     /// - nonce attendu : la TX est retournée ;
     /// - nonce déjà utilisé (rejeu ou conflit) : la TX est supprimée ;
     /// - nonce trop grand (trou) : la TX reste dans le pool.
+    /// - au plus `MAX_TXS_PER_BLOCK` TX : le reste attend le bloc suivant.
     pub fn drain(&mut self, chain: &Chain) -> Vec<Transaction> {
+        self.drain_up_to(chain, MAX_TXS_PER_BLOCK)
+    }
+
+    fn drain_up_to(&mut self, chain: &Chain, limit: usize) -> Vec<Transaction> {
         let mut pending: Vec<_> = self.txs.drain().collect();
         pending.sort_by(|(hash_a, a), (hash_b, b)| {
             (&a.from, a.nonce, hash_a).cmp(&(&b.from, b.nonce, hash_b))
@@ -54,6 +59,10 @@ impl Mempool {
         let mut next_nonces: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut ready = Vec::new();
         for (hash, tx) in pending {
+            if ready.len() == limit {
+                self.txs.insert(hash, tx);
+                continue;
+            }
             let next = next_nonces
                 .entry(tx.from.clone())
                 .or_insert_with(|| chain.next_nonce(&tx.from));
@@ -216,5 +225,30 @@ mod tests {
         chain.push(block).unwrap();
         assert_eq!(chain.next_nonce(&tx_from(5, 0, 0).from), 2);
         assert_eq!(chain.next_nonce(&tx_from(7, 0, 0).from), 3);
+    }
+
+    #[test]
+    fn drain_stops_at_limit_and_keeps_the_rest_in_nonce_order() {
+        let chain = chain();
+        let mut mempool = Mempool::new();
+        for nonce in 0..5 {
+            mempool.add(tx_from(7, 7, nonce)).unwrap();
+        }
+        let first = mempool.drain_up_to(&chain, 3);
+        assert_eq!(nonces(&first), [(7, 0), (7, 1), (7, 2)]);
+        assert_eq!(mempool.len(), 2);
+
+        let mut chain = chain;
+        let block = Block::new(
+            1,
+            chain.last().block_data.hash.clone(),
+            first,
+            1,
+            &validator(),
+        )
+        .unwrap();
+        chain.push(block).unwrap();
+        assert_eq!(nonces(&mempool.drain_up_to(&chain, 3)), [(7, 3), (7, 4)]);
+        assert!(mempool.is_empty());
     }
 }

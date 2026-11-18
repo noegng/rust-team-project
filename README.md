@@ -189,9 +189,7 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 | `GET /transactions/{hash}` | État d'une TX (`pending` ou `included` avec numéro et hash de bloc) |
 | `GET /blocks?limit=N` | Résumé des N derniers blocs (20 par défaut, 100 max), du plus récent au plus ancien, sans les TX |
 | `GET /blocks/{index}` | Récupère un bloc par son index |
-| `GET /metrics` | `txs_received`, `tps` (débit réel du dernier envoi : TX reçues entre la première et la dernière réception ; un envoi se termine après 1 s sans TX), `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `height`, `last_block_hash`, `public_key` |
-| `GET /peers` | Peers découverts par mDNS : `[{node_id, urls}]` |
-| `GET /` | Dashboard live |
+| `GET /metrics` | `txs_received`, `tps`, `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `txs_rejected`, `sync_resets`, `height`, `last_block_hash` |
 | `GET /ws` | Connexion WebSocket entre nodes |
 
 ## Tests
@@ -199,4 +197,35 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets
+```
+
+## Benchmark réseau (Criterion)
+
+3 nodes validateurs tournent chacun dans une tâche Tokio (ports loopback) et une 4e tâche leur envoie des TX en HTTP (`node::testnet`, feature `testnet`).
+
+```bash
+cargo bench -p node --features testnet            # mesure complète
+cargo bench -p node --features testnet -- --test  # vérification rapide (1 itération)
+```
+
+| Bench | Mesure |
+|---|---|
+| `sync/load_to_sync/{100,1000,5000}` | Envoi de N TX au node A jusqu'à ce que les 3 nodes aient les mêmes blocs et un mempool vide |
+| `bad_sync/reset_on_bad_block` | Temps pour qu'un node coupe un peer qui envoie un bloc invalide |
+| `bad_sync/load_with_bad_blocks/1000` | Même charge, pendant qu'un peer malveillant envoie 5 blocs invalides au node B |
+| `catch_up/late_node/1000` | Rattrapage d'un nouveau node sur une chaîne contenant 1000 TX |
+
+Après Criterion, le bench affiche et écrit dans `target/criterion/network_stats.json` : temps moyen / p50 / p95 / max de sync, lag après la fin de l'envoi, taux d'erreur (TX rejetées ou perdues / TX envoyées), nombre de resets de sync (total, par bloc invalide, inattendus), propagation et finalité moyennes, TPS jusqu'à la sync.
+
+## Flamegraph par node (samply)
+
+`scripts/profile-nodes.sh` lance 3 nodes (processus séparés `node-1..3`, ports 3101-3103, découverte mDNS) sous un seul [samply](https://github.com/mstange/samply), puis le client leur envoie `TX_COUNT` TX (défaut 10000). Un seul terminal suffit. Le profil `target/profiles/nodes.json.gz` contient une piste par node (build `--profile profiling` : release + symboles).
+
+Un seul samply pour les 3 nodes : plusieurs instances épuisent `kernel.perf_event_mlock_kb` (`Failed to start profiling: mmap failed`).
+
+```bash
+cargo install --locked samply                # une fois
+sudo sysctl kernel.perf_event_paranoid=1     # Linux, une fois par démarrage
+scripts/profile-nodes.sh                     # TX_COUNT=50000 BLOCK_TIME_SECS=1 scripts/profile-nodes.sh
+samply load target/profiles/nodes.json.gz    # choisir la piste node-N, onglet "Flame Graph"
 ```

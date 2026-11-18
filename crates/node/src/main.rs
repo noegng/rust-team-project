@@ -1,46 +1,8 @@
-mod api;
-mod discovery;
-mod metrics;
-mod p2p;
-mod validator;
+use std::{collections::HashMap, time::Duration};
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
-
-use axum::{
-    Router,
-    extract::{ConnectInfo, State, WebSocketUpgrade},
-    http::Method,
-    response::{Html, IntoResponse},
-    routing::{any, get, post},
-};
-use blockchain::{
-    block::Block,
-    chain::Chain,
-    mempool::{Mempool, MempoolError},
-    transaction::{Transaction, TransactionError},
-};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast};
-use tower_http::{
-    cors::{Any, CorsLayer},
-    trace::{DefaultMakeSpan, TraceLayer},
-};
+use node::NodeConfig;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload")]
-pub enum NodeMessage {
-    NewTx(Transaction),
-    /// Boxed: a block is much larger than the other variants.
-    NewBlock(Box<Block>),
-    Ping,
-}
 
 /// Reads `.env` from the current directory if present; shell variables keep priority.
 fn read_dotenv() -> HashMap<String, String> {
@@ -95,97 +57,6 @@ fn load_authorized_validators(
     Ok(validators)
 }
 
-struct NodeState {
-    chain: Mutex<Chain>,
-    mempool: Mutex<Mempool>,
-    signing_key: SigningKey,
-    metrics: metrics::Metrics,
-    gossip: broadcast::Sender<String>,
-    /// Peers vus par mDNS : ID du node → URLs HTTP candidates (une par IPv4).
-    peers: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
-}
-
-impl NodeState {
-    fn new(
-        signing_key: SigningKey,
-        authorized_validators: Vec<VerifyingKey>,
-    ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            authorized_validators.contains(&signing_key.verifying_key()),
-            "SECRET_KEY must belong to AUTHORIZED_VALIDATORS"
-        );
-        let unique: std::collections::HashSet<_> = authorized_validators
-            .iter()
-            .map(|key| key.to_bytes())
-            .collect();
-        anyhow::ensure!(
-            unique.len() == authorized_validators.len(),
-            "AUTHORIZED_VALIDATORS must not contain duplicates"
-        );
-        let (gossip, _) = broadcast::channel(16_384);
-        Ok(Self {
-            chain: Mutex::new(Chain::new(authorized_validators.clone())?),
-            mempool: Mutex::new(Mempool::new()),
-            signing_key,
-            metrics: metrics::Metrics::new(),
-            gossip,
-            peers: std::sync::Mutex::default(),
-        })
-    }
-
-    fn record_peer(&self, node_id: String, urls: Vec<String>) {
-        self.peers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(node_id, urls);
-    }
-
-    fn peers(&self) -> BTreeMap<String, Vec<String>> {
-        self.peers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    /// Shared admission path for HTTP and peers. Only new, valid TXs are relayed.
-    async fn submit_transaction(&self, tx: Transaction) -> Result<String, MempoolError> {
-        let message = serde_json::to_string(&NodeMessage::NewTx(tx.clone()))
-            .map_err(TransactionError::from)?;
-        let mut mempool = self.mempool.lock().await;
-        let hash = mempool.add(tx.clone())?;
-        self.metrics.record_tx(&tx);
-        // No connected peers is normal; the mempool is replayed on connection.
-        let _ = self.gossip.send(message);
-        tracing::debug!(%hash, mempool_len = mempool.len(), "transaction admitted");
-        Ok(hash)
-    }
-}
-
-/// Dashboard live : interroge ce node et ses peers depuis le navigateur.
-const DASHBOARD: &str = include_str!("dashboard.html");
-
-fn app(state: Arc<NodeState>) -> Router {
-    // Lecture seule : le dashboard servi par un node interroge les autres nodes.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET]);
-    Router::new()
-        .route("/", get(|| async { Html(DASHBOARD) }))
-        .route("/ws", any(ws_handler))
-        .route("/transactions", post(api::submit_transactions))
-        .route("/transactions/{hash}", get(api::get_transaction))
-        .route("/blocks", get(api::get_recent_blocks))
-        .route("/blocks/{index}", get(api::get_block))
-        .route("/metrics", get(api::get_metrics))
-        .route("/peers", get(api::get_peers))
-        .with_state(state)
-        .layer(cors)
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
-        )
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dotenv = read_dotenv();
@@ -204,55 +75,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let authorized_validators = load_authorized_validators(&dotenv)?;
-    let state = Arc::new(NodeState::new(signing_key, authorized_validators)?);
     let block_time: u64 = get_env(&dotenv, "BLOCK_TIME_SECS")
         .unwrap_or_else(|_| "2".into())
         .parse()?;
-    anyhow::ensure!(block_time > 0, "BLOCK_TIME_SECS must be greater than zero");
-    let app = app(Arc::clone(&state));
-
-    // run it with hyper
     let port: u16 = get_env(&dotenv, "PORT")
         .unwrap_or_else(|_| "3000".into())
         .parse()?;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await?;
-    let port = listener.local_addr()?.port();
-    tracing::debug!("listening on port {port}");
-    let node_id = format!(
-        "{:x}-{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        std::process::id(),
-    );
-    let discovery_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        if let Err(error) = discovery::discover_peers(node_id, port, discovery_state).await {
-            eprintln!("Discovery failed: {error}");
-        }
-    });
-    let validator = validator::Validator {
-        state,
+    node::run(NodeConfig {
+        signing_key,
+        authorized_validators,
+        port,
         block_time: Duration::from_secs(block_time),
-    };
-    tokio::spawn(validator.run());
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn ws_handler(
-    State(state): State<Arc<NodeState>>,
-    ws: WebSocketUpgrade,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        tracing::info!(%addr, "incoming peer connected");
-        p2p::handle_peer(socket, state).await;
-        tracing::info!(%addr, "incoming peer disconnected");
     })
+    .await
 }

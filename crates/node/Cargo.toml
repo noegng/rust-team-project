@@ -19,6 +19,17 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 futures-util = { version = "0.3.34", features = ["sink"] }
 mdns-sd = "0.21.6"
 hex = "0.4.3"
+reqwest = { version = "0.13.5", features = ["json"], optional = true }
+
+[features]
+# In-process multi-node network (`node::testnet`) for benchmarks.
+testnet = ["dep:reqwest"]
 
 [dev-dependencies]
 reqwest = { version = "0.13.5", features = ["json"] }
+criterion = { version = "0.7.0", features = ["async_tokio"] }
+
+[[bench]]
+name = "network"
+harness = false
+required-features = ["testnet"]

@@ -193,9 +193,12 @@ pub(crate) async fn submit_transactions(
     for tx in transactions {
         results.push(match state.submit_transaction(tx).await {
             Ok(hash) => TransactionResult::Accepted { hash },
-            Err(error) => TransactionResult::Rejected {
-                error: error.to_string(),
-            },
+            Err(error) => {
+                state.metrics.record_rejected_tx();
+                TransactionResult::Rejected {
+                    error: error.to_string(),
+                }
+            }
         });
     }
     Json(results)
@@ -367,6 +370,7 @@ mod tests {
             .unwrap();
         assert_eq!(initial["txs_received"], 0);
         assert_eq!(initial["txs_committed"], 0);
+        assert_eq!(initial["txs_rejected"], 0);
         assert_eq!(initial["mempool_len"], 0);
         assert_eq!(initial["chain_len"], 1);
         assert_eq!(initial["height"], 0);
@@ -404,6 +408,8 @@ mod tests {
             .unwrap();
         assert_eq!(pending["txs_received"], 1);
         assert_eq!(pending["txs_committed"], 0);
+        assert_eq!(pending["txs_rejected"], 2);
+        assert_eq!(pending["sync_resets"], 0);
         assert_eq!(pending["mempool_len"], 1);
         // Une seule TX : pas de durée, donc pas de débit mesurable.
         assert!(pending["tps"].is_null());
@@ -522,6 +528,7 @@ mod tests {
         assert!(matches!(&results[1], TransactionResult::Rejected { .. }));
         assert!(matches!(&results[2], TransactionResult::Rejected { .. }));
         assert_eq!(state.mempool.lock().await.len(), 1);
+        assert_eq!(state.metrics.snapshot(1, 1).txs_rejected, 2);
         assert_eq!(
             serde_json::to_value(&results[0]).unwrap(),
             serde_json::json!({"status": "accepted", "hash": hash}),
