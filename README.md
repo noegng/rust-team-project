@@ -120,6 +120,12 @@ Les autres nodes sont trouvés via `GET /peers` (découverte mDNS). Si mDNS ne
 passe pas, fixer la liste dans l'URL :
 `http://<IP_PC_A>:3000/?nodes=http://<IP_PC_A>:3000,http://<IP_PC_B>:3000,http://<IP_PC_C>:3000`.
 
+Le dashboard suit aussi les tests et benchmarks :
+
+- `scripts/stress.sh` et `scripts/profile-nodes.sh` affichent son URL au démarrage ;
+- les nodes du `Testnet` (tests, Criterion) se déclarent les uns aux autres dans `GET /peers`, donc le `/` de n'importe lequel montre tout le réseau ;
+- `DASHBOARD_PORT=3200 cargo bench -p node --features testnet -- stress` fixe les ports (3200-3202) de chaque réseau lancé par le bench, et affiche l'URL à ouvrir une fois : le même onglet suit toutes les itérations (chaque itération repart d'une chaîne neuve). Le polling du navigateur ajoute un peu de charge aux mesures.
+
 ## Stress test (`scripts/stress.sh`)
 
 Nécessite `curl` et `jq` (et `openssl` en local). Le script affiche la
