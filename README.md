@@ -1,14 +1,193 @@
 # Authora (`rust-team-project`)
 
-Mini-blockchain Proof of Authority (PoA) en Rust (voir [authora.md](authora.md) pour la spec d'origine).
+Mini-blockchain privée en **Proof of Authority (PoA)**, écrite en Rust : un
+workspace, **3 full nodes** validateurs et un **client de benchmark**. La
+consigne d'origine est dans [authora.md](authora.md) ; ce README suit son plan
+et indique, pour chaque partie, ce qui a été réalisé et où se trouve le code.
 
-## Crates
+**Sommaire** : [Objectif](#objectif) · [Stack](#stack) · [Workspace](#structure-du-workspace) ·
+[Structures de données](#structures-de-données-crate-blockchain) · [Cryptographie](#cryptographie) ·
+[Réseau](#réseau) · [Consensus PoA](#consensus-poa) · [Benchmark et métriques](#benchmark-et-métriques) ·
+[Démo finale](#démo-finale-attendue) · [Robustesse réseau](#robustesse-réseau-ce-que-les-tests-multi-pc-ont-révélé) ·
+[Écarts avec la spec](#écarts-avec-la-spec) · [Lancer le projet](#lancer-la-démo-dans-4-terminaux)
 
-| Crate | Rôle |
+## Objectif
+
+Trois nodes, chacun détenteur d'une clé ed25519 autorisée, reçoivent des
+transactions signées, se les diffusent (gossip) et produisent à tour de rôle un
+bloc signé toutes les `BLOCK_TIME_SECS` secondes. À la fin, les trois nodes ont
+**la même chaîne**, et l'on mesure le **TPS**, la **latence de propagation**, le
+**lag de synchronisation** et le **temps de finalité**.
+
+## Stack
+
+| Besoin | Crate utilisé |
 |---|---|
-| `crates/blockchain` | `Transaction`, `Block`, `Chain` (validation PoA, nonces), `Mempool` |
-| `crates/node` | Node : API HTTP, gossip WebSocket + replay, découverte mDNS, production de blocs, métriques |
-| `crates/client` | Benchmark : envoie des TX signées par lots et vérifie leur inclusion sur tous les nodes |
+| Runtime async | `tokio` |
+| Serveur HTTP + WebSocket | `axum` 0.8 (`ws`) |
+| Client WebSocket (connexion aux peers) | `tokio-tungstenite` |
+| Hachage | `sha2` (SHA-256) |
+| Signatures, paires de clés | `ed25519-dalek` |
+| Sérialisation | `serde` + `serde_json` |
+| Client HTTP (benchmark) | `reqwest` |
+| Génération de clés | `rand` |
+| *Ajouts* : découverte des peers | `mdns-sd` |
+| *Ajouts* : vérification parallèle des signatures | `rayon` |
+| *Ajouts* : logs, CORS du dashboard | `tracing`, `tower-http` |
+
+## Structure du workspace
+
+```
+rust-team-project/
+├── Cargo.toml                 ← workspace (blockchain, node, client)
+├── crates/
+│   ├── blockchain/            ← lib : types et règles du protocole
+│   │   └── src/ block.rs · transaction.rs · chain.rs · mempool.rs
+│   ├── node/                  ← binaire : full node
+│   │   └── src/ main.rs       ← lecture de la config (.env / variables)
+│   │            lib.rs        ← état partagé, routes, démarrage
+│   │            api.rs        ← HTTP : soumission des TX, blocs, métriques
+│   │            p2p.rs        ← gossip WebSocket entre nodes
+│   │            discovery.rs  ← découverte mDNS + reconnexion
+│   │            validator.rs  ← production et acceptation des blocs
+│   │            metrics.rs    ← compteurs (TPS, propagation, finalité…)
+│   │            dashboard.html← dashboard live servi sur /
+│   │            testnet.rs    ← réseau de 3 nodes en mémoire (tests, benchs)
+│   └── client/                ← binaire : spammer / benchmark
+│       └── src/ main.rs · network.rs · confirmation.rs
+└── scripts/ stress.sh · profile-nodes.sh
+```
+
+La répartition de la consigne (P1 `blockchain`, P2 réseau du node, P3
+validateur + client) se retrouve dans ce découpage : `blockchain` ne dépend
+d'aucun réseau et se teste seul, `node` et `client` s'appuient dessus.
+
+## Structures de données (crate `blockchain`)
+
+| Type | Contenu | Règles vérifiées |
+|---|---|---|
+| `Transaction` | `from`, `to` (clés publiques), `amount`, `nonce`, `timestamp`, `signature` | Signature ed25519 de l'expéditeur sur tous les autres champs ; hash SHA-256 = identifiant de la TX |
+| `Block` | `BlockData` (`index`, `timestamp`, `prev_hash`, `hash`, `transactions`, `tx_root`) + `validator` + `signature` | `tx_root` = hash des TX, `hash` recalculé, signature du validateur sur l'en-tête |
+| `Chain` | Blocs depuis la genèse + liste ordonnée des validateurs | Successeur valide : bon index, bon `prev_hash`, horodatage croissant, validateur autorisé **et** proposant attendu, signatures, nonces des expéditeurs, au plus `MAX_TXS_PER_BLOCK` (20 000) TX |
+| `Mempool` | TX en attente, indexées par hash, avec déduplication | Refuse les doublons ; `drain` ne prend que les TX dont le nonce suit celui de la chaîne (ordre par expéditeur) |
+
+**Anti-rejeu** : chaque expéditeur a un `nonce` qui doit valoir exactement le
+suivant attendu par la chaîne. Une TX rejouée ou hors ordre est refusée.
+
+## Cryptographie
+
+- **Clé du node** : `SECRET_KEY` (32 octets hex). Le node affiche sa clé
+  publique au démarrage (`node public key: …`), à mettre dans
+  `AUTHORIZED_VALIDATORS` sur les trois machines.
+- **Signature des TX** côté client, **signature des blocs** côté validateur.
+- **Vérification** de toutes les signatures à la réception, par tous les nodes.
+  Pour tenir la charge, les signatures d'un lot sont vérifiées **en parallèle**
+  (`rayon`) et **hors des verrous** de la chaîne et du mempool.
+
+## Réseau
+
+```
+[Client] ── HTTP POST /transactions (lots de TX) ──► [Node A]
+                                                        │  gossip WebSocket (/ws)
+                                        ┌───────────────┴───────────────┐
+                                     [Node B] ◄──────── WS ────────► [Node C]
+```
+
+- **Entrée HTTP (`api.rs`)** : `POST /transactions` accepte un **lot** de TX,
+  vérifie chacune, ajoute les valides au mempool et les diffuse aux peers en un
+  seul message (`NewTxs`).
+- **Gossip (`p2p.rs`)** : chaque paire de nodes partage une connexion
+  WebSocket. Messages échangés (JSON `{"type", "payload"}`) :
+
+  | Message | Rôle |
+  |---|---|
+  | `Hello(clé)` | Premier message : identité de l'émetteur (détecte une connexion à soi-même) |
+  | `NewTx` / `NewTxs` | Transactions admises |
+  | `NewBlock` | Bloc produit ou relayé |
+  | `HistoryEnd` | Fin de l'historique envoyé à un nouveau peer |
+  | `Ping` | Battement de cœur (connexion vivante) |
+
+- **À la connexion**, chaque node renvoie à l'autre toute sa chaîne puis son
+  mempool (*replay*) : un node relancé ou en retard rattrape ainsi les autres.
+- **Découverte** : la consigne prévoyait des adresses codées en dur. Nous
+  utilisons **mDNS** (`discovery.rs`) : les nodes d'un même réseau se trouvent
+  seuls, sans configuration. Seul le node d'identifiant le plus petit initie la
+  connexion de chaque paire (une seule connexion par paire), et il la rétablit
+  après toute coupure.
+
+## Consensus PoA
+
+- **Rotation (round-robin)** : le bloc d'index *n* revient à
+  `AUTHORIZED_VALIDATORS[n % 3]`. L'ordre de la liste doit donc être
+  **identique sur les trois nodes**.
+- **Production (`validator.rs`)** : toutes les `BLOCK_TIME_SECS`, si c'est son
+  tour, le node vide le mempool (dans la limite de 20 000 TX), construit le
+  bloc, le signe, l'ajoute à sa chaîne et le diffuse. Les **blocs vides** sont
+  produits aussi, sinon la rotation se bloquerait.
+- **Acceptation d'un bloc reçu** : toutes les règles de `Chain` ci-dessus. Un
+  bloc déjà connu est ignoré ; un bloc invalide fait couper la connexion, qui
+  est rétablie et rejoue l'historique (`sync_resets` dans les métriques).
+- **Synchronisation au démarrage** : un node ne produit rien avant d'avoir reçu
+  l'historique de ses peers (voir [Robustesse](#robustesse-réseau-ce-que-les-tests-multi-pc-ont-révélé)).
+
+## Benchmark et métriques
+
+Le **client** (`crates/client`) signe des TX avec plusieurs clés expéditeurs,
+les envoie en lots par `CONCURRENCY` tâches parallèles, puis **vérifie leur
+inclusion sur tous les nodes** (`METRICS_URLS`) et affiche le bilan. Il peut
+aussi simuler un trafic continu (lots et pauses aléatoires).
+
+| Métrique de la consigne | Où la lire | Calcul |
+|---|---|---|
+| TPS | `GET /metrics` → `tps`, bilan du client | Débit réel de la dernière rafale : TX reçues entre la première et la dernière réception (une rafale se termine après 1 s sans TX) |
+| Latence de propagation | `avg_propagation_ms` | Horodatage de la TX (posé par le client) → réception par chaque node |
+| Lag de synchronisation | `mempool_len`, `height`, `last_block_hash` de chaque node | Écart entre les nodes, visible sur le dashboard |
+| Temps de finalité | `avg_finality_ms`, bilan du client | TX soumise → incluse dans un bloc sur **tous** les nodes |
+
+Outils complémentaires : [dashboard live](#dashboard),
+[stress test multi-machines](#stress-test-scriptsstresssh),
+[benchmarks Criterion](#benchmark-réseau-criterion) et
+[flamegraphs](#flamegraph-par-node-samply).
+
+## Démo finale attendue
+
+| Étape de la consigne | Comment la montrer |
+|---|---|
+| 1. Les 3 nodes démarrent et se connectent | `connected to peer` dans les logs ; les 3 nodes sur le dashboard |
+| 2. Le client envoie 10 000 TX sur le node A | `TX_COUNT=10000 … cargo run --release -p client` (voir plus bas) |
+| 3. B et C reçoivent toutes les TX par gossip | `txs_received` de chaque node, courbes TX/s du dashboard |
+| 4. Le validateur désigné produit un bloc signé toutes les N s | Histogramme « TX par bloc », coloré par node producteur ; tableau des derniers blocs |
+| 5. Les 3 nodes ont la même chaîne | Bandeau « Synchronisés : 3 nodes sur le bloc #… » ; bilan `confirmed everywhere: 10000/10000` |
+| 6. Affichage TPS, propagation, longueur de chaîne | Cartes des nodes du dashboard ; `GET /metrics` |
+
+## Robustesse réseau (ce que les tests multi-PC ont révélé)
+
+Les tests sur 3 PC reliés par ZeroTier ou un partage de connexion ont montré
+des pannes absentes en local. Chacune a un correctif dédié :
+
+| Problème observé | Correctif |
+|---|---|
+| Un node relancé repart de la genèse et crée son propre bloc 1 → **fourche** et reconnexions en boucle | Le node ne produit qu'après la découverte des peers et la réception de **tout l'historique** de chacun (`HistoryEnd`) |
+| Une connexion morte sans erreur laisse un node **isolé** ; la chaîne se bloque à son tour | **Heartbeat** : `Ping` toutes les 2 s, connexion coupée après 15 s de silence puis rétablie |
+| Sur un partage de connexion iPhone, tous les appareils ont l'adresse `192.0.0.2` → un node **se connecte à lui-même** | Ces adresses sont ignorées, et le message `Hello` (clé publique) fait refuser toute connexion à soi-même |
+| TPS moyen depuis le démarrage, trompeur | TPS mesuré sur la **dernière rafale** |
+| Bloc trop gros pour une trame WebSocket (16 Mo) | Plafond de **20 000 TX par bloc** |
+
+**Limites encore ouvertes** : si un validateur est arrêté, la chaîne attend son
+tour (pas de saut de tour) ; une fourche déjà formée n'est pas réparée
+automatiquement (pas de règle de la chaîne la plus longue) ; sur un réseau lent
+ou relayé, le débit entre nodes chute nettement. Préférer un même réseau local.
+
+## Écarts avec la spec
+
+| Spec | Implémentation | Raison |
+|---|---|---|
+| `POST /tx`, une TX | `POST /transactions`, un lot de TX | Débit : moins de requêtes et un seul message de gossip par lot |
+| Peers codés en dur | Découverte mDNS | Aucune IP à saisir, fonctionne sur 3 PC |
+| `Message { NewTx, NewBlock, Ping }` | + `NewTxs`, `HistoryEnd`, `Hello` | Lots, rattrapage au démarrage, détection de soi-même |
+| `mempool.drain()` de toutes les TX | TX dans l'ordre des nonces, 20 000 max par bloc | Anti-rejeu et taille de trame |
+| Validation du successeur | + horodatage croissant, proposant attendu, nonces | Sécurité du consensus |
+| Bloc produit seulement s'il y a des TX | Blocs vides produits | La rotation ne doit pas se bloquer |
 
 ## Lancer la démo dans 4 terminaux
 
@@ -209,6 +388,7 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 | `GET /blocks/{index}` | Récupère un bloc par son index |
 | `GET /metrics` | `txs_received`, `tps` (débit réel du dernier envoi : TX reçues entre la première et la dernière réception ; un envoi se termine après 1 s sans TX), `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `txs_rejected` (TX refusées par `POST /transactions`), `sync_resets` (connexions peer coupées sur un bloc rejeté), `height`, `last_block_hash`, `public_key` |
 | `GET /peers` | Peers découverts par mDNS : `[{node_id, urls}]` |
+| `GET /mempool` | Contenu du mempool, regroupé par expéditeur (affiché par le dashboard) |
 | `GET /` | Dashboard live |
 | `GET /ws` | Connexion WebSocket entre nodes |
 
