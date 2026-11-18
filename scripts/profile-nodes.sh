@@ -123,6 +123,7 @@ done
 
 echo "sending $TX_COUNT transactions to node 1..."
 NODE_URL=${URLS[0]} METRICS_URLS=$(IFS=,; echo "${URLS[*]}") TX_COUNT=$TX_COUNT \
+    MIN_BATCH_SIZE=100 MAX_PAUSE_MS=0 \
     "$CLIENT_BIN" | tee "$OUT/client.log"
 
 cleanup

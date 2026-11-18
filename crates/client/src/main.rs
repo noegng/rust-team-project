@@ -2,11 +2,11 @@ mod confirmation;
 mod errors;
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 use blockchain::transaction::Transaction;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -14,56 +14,86 @@ use serde::Deserialize;
 
 use crate::errors::ClientError;
 
-/// Benchmark : envoie `TX_COUNT` TX signées sur `NODE_URL/transactions`
-/// par lots de `BATCH_SIZE`, avec `CONCURRENCY` tâches en parallèle, attend leur
+/// Simule du trafic : envoie des TX signées sur `NODE_URL/transactions` avec
+/// `CONCURRENCY` tâches en parallèle. Chaque tâche envoie des lots de taille
+/// aléatoire (`MIN_BATCH_SIZE..=BATCH_SIZE`) séparés de pauses aléatoires
+/// (`0..=MAX_PAUSE_MS`).
+///
+/// Sans `TX_COUNT`, tourne jusqu'à Ctrl+C puis affiche le bilan et les métriques.
+/// Avec `TX_COUNT` (benchmark), s'arrête après ce nombre de TX, attend leur
 /// confirmation sur tous les nodes de `METRICS_URLS`, puis affiche les métriques.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::from_env(|name| std::env::var(name).ok())?;
-    let counters = Arc::new(Counters::default());
+    // En continu, garder chaque hash ferait grossir la mémoire sans limite.
+    let counters = Arc::new(Counters {
+        skip_hashes: config.tx_count.is_none(),
+        ..Counters::default()
+    });
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
     let recipient = random_key()?.verifying_key();
 
+    let amount = config
+        .tx_count
+        .map_or("TX until Ctrl+C".into(), |count| format!("{count} TX"));
     println!(
-        "sending {} TX to {} with {} tasks, {} TX per request",
-        config.tx_count, config.node_url, config.concurrency, config.batch_size
+        "sending {amount} to {} with {} tasks, {}-{} TX per request, pauses of 0-{}ms",
+        config.node_url,
+        config.concurrency,
+        config.traffic.min_batch,
+        config.traffic.max_batch,
+        config.traffic.max_pause_ms
     );
     let started = Instant::now();
     let progress = tokio::spawn(report_progress(Arc::clone(&counters), started));
-    let handles: Vec<_> = split_work(config.tx_count, config.concurrency)
-        .into_iter()
-        .map(|count| {
-            let client = client.clone();
-            let url = format!("{}/transactions", config.node_url.trim_end_matches('/'));
-            let batch_size = config.batch_size;
-            let counters = Arc::clone(&counters);
-            tokio::spawn(async move {
-                spam(client, url, recipient, count, batch_size, counters, started).await
-            })
-        })
-        .collect();
+    let worker_counts = match config.tx_count {
+        Some(total) => split_work(total, config.concurrency),
+        None => vec![u64::MAX; config.concurrency as usize],
+    };
+    let mut workers = JoinSet::new();
+    for count in worker_counts {
+        let client = client.clone();
+        let url = format!("{}/transactions", config.node_url.trim_end_matches('/'));
+        let traffic = config.traffic;
+        let counters = Arc::clone(&counters);
+        workers.spawn(async move {
+            spam(client, url, recipient, count, traffic, counters, started).await
+        });
+    }
     let mut failed_workers = 0;
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                failed_workers += 1;
-                eprintln!(
-                    "[{:.1}s] worker stopped: {err}",
-                    started.elapsed().as_secs_f64()
-                );
-            }
-            Err(err) => {
-                failed_workers += 1;
-                eprintln!(
-                    "[{:.1}s] worker failed: {err}",
-                    started.elapsed().as_secs_f64()
-                );
+    let mut interrupted = false;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            result = workers.join_next() => match result {
+                None => break,
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(err))) => {
+                    failed_workers += 1;
+                    eprintln!("[{:.1}s] worker stopped: {err}", started.elapsed().as_secs_f64());
+                }
+                Some(Err(err)) => {
+                    failed_workers += 1;
+                    eprintln!("[{:.1}s] worker failed: {err}", started.elapsed().as_secs_f64());
+                }
+            },
+            _ = &mut ctrl_c => {
+                interrupted = true;
+                workers.abort_all();
+                println!("stopping (Ctrl+C again to quit now)");
+                // Le handler de tokio remplace l'arrêt par défaut sur SIGINT.
+                tokio::spawn(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                    std::process::exit(130);
+                });
+                break;
             }
         }
     }
+    drop(workers);
     progress.abort();
     let elapsed = started.elapsed().as_secs_f64();
 
@@ -80,6 +110,10 @@ async fn main() -> anyhow::Result<()> {
         accepted as f64 / elapsed.max(f64::EPSILON)
     );
 
+    let Some(tx_count) = config.tx_count else {
+        print_metrics(&client, &config.metrics_urls).await;
+        return Ok(());
+    };
     let hashes = counters.hashes.lock().await.clone();
     println!(
         "waiting up to {}s for inclusion on {} nodes",
@@ -110,12 +144,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    for url in &config.metrics_urls {
-        match fetch_metrics(&client, url).await {
-            Ok(metrics) => println!("{url}: {metrics}"),
-            Err(err) => eprintln!("{url}: {err}"),
-        }
-    }
+    print_metrics(&client, &config.metrics_urls).await;
     let report = confirmations?;
     anyhow::ensure!(
         report.complete(),
@@ -123,19 +152,28 @@ async fn main() -> anyhow::Result<()> {
         report.total - report.confirmed
     );
     anyhow::ensure!(
-        failed_workers == 0 && rejected == 0 && accepted == config.tx_count,
-        "benchmark incomplete: {accepted}/{} accepted, {rejected} rejected, {failed_workers} failed workers",
-        config.tx_count
+        !interrupted && failed_workers == 0 && rejected == 0 && accepted == tx_count,
+        "benchmark incomplete: {accepted}/{tx_count} accepted, {rejected} rejected, {failed_workers} failed workers"
     );
     Ok(())
+}
+
+async fn print_metrics(client: &reqwest::Client, urls: &[String]) {
+    for url in urls {
+        match fetch_metrics(client, url).await {
+            Ok(metrics) => println!("{url}: {metrics}"),
+            Err(err) => eprintln!("{url}: {err}"),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
 struct Config {
     node_url: String,
-    tx_count: u64,
+    /// `None` : envoi continu jusqu'à Ctrl+C.
+    tx_count: Option<u64>,
     concurrency: u64,
-    batch_size: u64,
+    traffic: Traffic,
     metrics_urls: Vec<String>,
     confirm_timeout_secs: u64,
     poll_interval_ms: u64,
@@ -144,9 +182,19 @@ struct Config {
 impl Config {
     fn from_env(var: impl Fn(&str) -> Option<String>) -> Result<Self, ClientError> {
         let node_url = var("NODE_URL").unwrap_or_else(|| "http://127.0.0.1:3000".into());
-        let tx_count = parse_number(&var, "TX_COUNT", 10_000)?;
+        let tx_count = var("TX_COUNT")
+            .map(|_| parse_number(&var, "TX_COUNT", 0))
+            .transpose()?;
         let concurrency = parse_positive(&var, "CONCURRENCY", 50)?;
-        let batch_size = parse_positive(&var, "BATCH_SIZE", 100)?;
+        let max_batch = parse_positive(&var, "BATCH_SIZE", 100)?;
+        let min_batch = parse_positive(&var, "MIN_BATCH_SIZE", 1)?;
+        if min_batch > max_batch {
+            return Err(ClientError::InvalidConfig {
+                name: "MIN_BATCH_SIZE",
+                value: format!("{min_batch} (above BATCH_SIZE {max_batch})"),
+            });
+        }
+        let max_pause_ms = parse_number(&var, "MAX_PAUSE_MS", 1000)?;
         let confirm_timeout_secs = parse_positive(&var, "CONFIRM_TIMEOUT_SECS", 60)?;
         let poll_interval_ms = parse_positive(&var, "POLL_INTERVAL_MS", 500)?;
         let mut metrics_urls: Vec<String> = match var("METRICS_URLS") {
@@ -165,7 +213,11 @@ impl Config {
             node_url,
             tx_count,
             concurrency,
-            batch_size,
+            traffic: Traffic {
+                min_batch,
+                max_batch,
+                max_pause_ms,
+            },
             metrics_urls,
             confirm_timeout_secs,
             poll_interval_ms,
@@ -205,6 +257,8 @@ struct Counters {
     accepted: AtomicU64,
     rejected: AtomicU64,
     hashes: Mutex<HashSet<String>>,
+    /// Ne pas conserver les hashes acceptés (envoi continu, sans confirmation).
+    skip_hashes: bool,
     rejections: StdMutex<HashMap<String, u64>>,
 }
 
@@ -268,20 +322,47 @@ enum TransactionResult {
     Rejected { error: String },
 }
 
+/// Forme du trafic d'une tâche : lots de `min_batch..=max_batch` TX,
+/// chacun précédé d'une pause de `0..=max_pause_ms` ms (tirages uniformes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Traffic {
+    min_batch: u64,
+    max_batch: u64,
+    max_pause_ms: u64,
+}
+
+impl Traffic {
+    fn next_batch(&self, remaining: u64) -> Result<u64, ClientError> {
+        let spread = self.max_batch - self.min_batch + 1;
+        Ok(remaining.min(self.min_batch + random_below(spread)?))
+    }
+
+    fn next_pause(&self) -> Result<Duration, ClientError> {
+        let pause = random_below(self.max_pause_ms.saturating_add(1))?;
+        Ok(Duration::from_millis(pause))
+    }
+}
+
 /// Une tâche = un expéditeur avec sa propre clé : ses nonces partent de 0
-/// et arrivent dans l'ordre sur le node, lot après lot.
+/// et arrivent dans l'ordre sur le node, lot après lot. La pause avant le
+/// premier lot décale aussi le départ des tâches entre elles.
 async fn spam(
     client: reqwest::Client,
     url: String,
     recipient: VerifyingKey,
     count: u64,
-    batch_size: u64,
+    traffic: Traffic,
     counters: Arc<Counters>,
     started: Instant,
 ) -> Result<(), ClientError> {
     let sender = random_key()?;
-    for nonces in nonce_batches(count, batch_size) {
-        let len = (nonces.end - nonces.start) as usize;
+    let mut next_nonce = 0;
+    while next_nonce < count {
+        tokio::time::sleep(traffic.next_pause()?).await;
+        let len = traffic.next_batch(count - next_nonce)?;
+        let nonces = next_nonce..next_nonce + len;
+        next_nonce += len;
+        let len = len as usize;
         let mut batch = Vec::with_capacity(len);
         let mut expected_hashes = Vec::with_capacity(len);
         for nonce in nonces {
@@ -319,18 +400,13 @@ async fn spam(
         }
         if !batch_hashes.is_empty() {
             let added = batch_hashes.len() as u64;
-            counters.hashes.lock().await.extend(batch_hashes);
+            if !counters.skip_hashes {
+                counters.hashes.lock().await.extend(batch_hashes);
+            }
             counters.accepted.fetch_add(added, Ordering::Relaxed);
         }
     }
     Ok(())
-}
-
-/// Nonces `0..count` découpés en lots consécutifs d'au plus `batch_size`.
-fn nonce_batches(count: u64, batch_size: u64) -> impl Iterator<Item = Range<u64>> {
-    (0..count)
-        .step_by(batch_size as usize)
-        .map(move |start| start..count.min(start + batch_size))
 }
 
 async fn fetch_metrics(
@@ -354,8 +430,13 @@ fn split_work(total: u64, workers: u64) -> Vec<u64> {
 
 fn random_key() -> Result<SigningKey, ClientError> {
     let mut secret = [0; 32];
-    getrandom::fill(&mut secret).map_err(ClientError::KeyGeneration)?;
+    getrandom::fill(&mut secret).map_err(ClientError::Random)?;
     Ok(SigningKey::from_bytes(&secret))
+}
+
+/// Tirage dans `0..bound` (`bound > 0`) ; le biais du modulo est négligeable ici.
+fn random_below(bound: u64) -> Result<u64, ClientError> {
+    Ok(getrandom::u64().map_err(ClientError::Random)? % bound)
 }
 
 fn unix_millis() -> u64 {
@@ -410,7 +491,11 @@ mod tests {
             url,
             random_key().unwrap().verifying_key(),
             count,
-            batch_size,
+            Traffic {
+                min_batch: batch_size,
+                max_batch: batch_size,
+                max_pause_ms: 0,
+            },
             Arc::clone(&counters),
             Instant::now(),
         )
@@ -483,9 +568,13 @@ mod tests {
             config,
             Config {
                 node_url: "http://127.0.0.1:3000".into(),
-                tx_count: 10_000,
+                tx_count: None,
                 concurrency: 50,
-                batch_size: 100,
+                traffic: Traffic {
+                    min_batch: 1,
+                    max_batch: 100,
+                    max_pause_ms: 1000,
+                },
                 metrics_urls: vec!["http://127.0.0.1:3000".into()],
                 confirm_timeout_secs: 60,
                 poll_interval_ms: 500,
@@ -500,14 +589,23 @@ mod tests {
             ("TX_COUNT", "100"),
             ("CONCURRENCY", "4"),
             ("BATCH_SIZE", "25"),
+            ("MIN_BATCH_SIZE", "5"),
+            ("MAX_PAUSE_MS", "0"),
             ("METRICS_URLS", "http://a:8001, http://b:8002"),
             ("CONFIRM_TIMEOUT_SECS", "20"),
             ("POLL_INTERVAL_MS", "100"),
         ]))
         .unwrap();
-        assert_eq!(config.tx_count, 100);
+        assert_eq!(config.tx_count, Some(100));
         assert_eq!(config.concurrency, 4);
-        assert_eq!(config.batch_size, 25);
+        assert_eq!(
+            config.traffic,
+            Traffic {
+                min_batch: 5,
+                max_batch: 25,
+                max_pause_ms: 0,
+            }
+        );
         assert_eq!(config.metrics_urls, ["http://a:8001", "http://b:8002"]);
         assert_eq!(config.confirm_timeout_secs, 20);
         assert_eq!(config.poll_interval_ms, 100);
@@ -518,11 +616,13 @@ mod tests {
         for name in [
             "CONCURRENCY",
             "BATCH_SIZE",
+            "MIN_BATCH_SIZE",
             "CONFIRM_TIMEOUT_SECS",
             "POLL_INTERVAL_MS",
         ] {
             assert!(Config::from_env(vars(&[(name, "0")])).is_err());
         }
+        assert!(Config::from_env(vars(&[("MIN_BATCH_SIZE", "10"), ("BATCH_SIZE", "5")])).is_err());
         assert!(Config::from_env(vars(&[("METRICS_URLS", "")])).is_err());
         assert!(Config::from_env(vars(&[("METRICS_URLS", "http://a:3000,")])).is_err());
         assert!(matches!(
@@ -549,9 +649,64 @@ mod tests {
     }
 
     #[test]
-    fn nonces_are_batched_in_order() {
-        assert_eq!(nonce_batches(5, 2).collect::<Vec<_>>(), [0..2, 2..4, 4..5]);
-        assert_eq!(nonce_batches(0, 2).count(), 0);
+    fn random_traffic_stays_within_bounds() {
+        let traffic = Traffic {
+            min_batch: 3,
+            max_batch: 7,
+            max_pause_ms: 20,
+        };
+        let mut sizes = HashSet::new();
+        for _ in 0..1000 {
+            let size = traffic.next_batch(100).unwrap();
+            assert!((3..=7).contains(&size));
+            sizes.insert(size);
+            assert!(traffic.next_pause().unwrap() <= Duration::from_millis(20));
+        }
+        assert_eq!(sizes.len(), 5, "every size in range is drawn");
+        assert_eq!(traffic.next_batch(2).unwrap(), 2, "last batch is clamped");
+    }
+
+    #[tokio::test]
+    async fn random_batches_send_every_nonce_in_order() {
+        let nonces = Arc::new(StdMutex::new(Vec::new()));
+        let seen = Arc::clone(&nonces);
+        let app = Router::new().route(
+            "/transactions",
+            post(move |Json(txs): Json<Vec<Transaction>>| async move {
+                assert!((1..=4).contains(&txs.len()));
+                seen.lock().unwrap().extend(txs.iter().map(|tx| tx.nonce));
+                Json(
+                    txs.iter()
+                        .map(|tx| serde_json::json!({"status": "accepted", "hash": tx.calculate_hash().unwrap()}))
+                        .collect::<Vec<_>>(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/transactions", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let counters = Arc::new(Counters::default());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let traffic = Traffic {
+            min_batch: 1,
+            max_batch: 4,
+            max_pause_ms: 5,
+        };
+        let recipient = random_key().unwrap().verifying_key();
+        spam(
+            client,
+            url,
+            recipient,
+            30,
+            traffic,
+            Arc::clone(&counters),
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(*nonces.lock().unwrap(), (0..30).collect::<Vec<_>>());
+        assert_eq!(counters.accepted.load(Ordering::Relaxed), 30);
     }
 
     #[test]

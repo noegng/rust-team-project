@@ -5,8 +5,8 @@ pub(crate) enum ClientError {
     #[error("invalid {name}: {value:?}")]
     InvalidConfig { name: &'static str, value: String },
 
-    #[error("could not generate a key: {0}")]
-    KeyGeneration(getrandom::Error),
+    #[error("random generator failed: {0}")]
+    Random(getrandom::Error),
 
     #[error("could not build transaction: {0}")]
     Transaction(#[from] TransactionError),
