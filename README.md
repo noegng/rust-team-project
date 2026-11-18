@@ -221,7 +221,7 @@ Après Criterion, le bench affiche et écrit dans `target/criterion/network_stat
 
 ## Flamegraph par node (samply)
 
-`scripts/profile-nodes.sh` lance 3 nodes (processus séparés `node-1..3`, ports 3101-3103, découverte mDNS) sous un seul [samply](https://github.com/mstange/samply), puis le client leur envoie `TX_COUNT` TX (défaut 10000). Un seul terminal suffit. Le profil `target/profiles/nodes.json.gz` contient une piste par node (build `--profile profiling` : release + symboles).
+`scripts/profile-nodes.sh` lance 3 nodes (processus séparés `node-1..3`, ports 3101-3103, découverte mDNS) sous un seul [samply](https://github.com/mstange/samply), puis le client leur envoie `TX_COUNT` TX (défaut 50000, échantillonnage `SAMPLE_RATE` = 4000 Hz). Un seul terminal suffit. Le profil `target/profiles/nodes.json.gz` contient une piste par node (build `--profile profiling` : release + symboles).
 
 Un seul samply pour les 3 nodes : plusieurs instances épuisent `kernel.perf_event_mlock_kb` (`Failed to start profiling: mmap failed`).
 
@@ -229,5 +229,5 @@ Un seul samply pour les 3 nodes : plusieurs instances épuisent `kernel.perf_eve
 cargo install --locked samply                # une fois
 sudo sysctl kernel.perf_event_paranoid=1     # Linux, une fois par démarrage
 scripts/profile-nodes.sh                     # TX_COUNT=50000 BLOCK_TIME_SECS=1 scripts/profile-nodes.sh
-samply load target/profiles/nodes.json.gz    # choisir la piste node-N, onglet "Flame Graph"
+samply load target/profiles/nodes.json.gz    # déplier node-N, Ctrl+clic sur toutes ses pistes tokio-rt-worker, onglet "Flame Graph"
 ```
