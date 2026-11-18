@@ -41,6 +41,9 @@ pub enum NodeMessage {
     Ping,
     /// Sent once after replaying the chain to a new peer: the peer has our whole history.
     HistoryEnd,
+    /// First message on every connection: the sender's public key (hex).
+    /// A node that receives its own key has dialed itself.
+    Hello(String),
 }
 
 struct NodeState {

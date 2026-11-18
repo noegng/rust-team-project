@@ -57,12 +57,30 @@ macro_rules! peer_message {
 peer_message!(AxumMessage);
 peer_message!(TungsteniteMessage);
 
+/// Why a peer connection ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PeerExit {
+    Disconnected,
+    /// The address led back to this node (e.g. an address several machines share).
+    Ourselves,
+}
+
 pub(crate) async fn handle_peer<S, M, E>(socket: S, state: Arc<NodeState>)
 where
     S: Stream<Item = Result<M, E>> + Sink<M, Error = E> + Unpin,
     M: PeerMessage,
     E: Display,
 {
+    run_peer(socket, state).await;
+}
+
+pub(crate) async fn run_peer<S, M, E>(socket: S, state: Arc<NodeState>) -> PeerExit
+where
+    S: Stream<Item = Result<M, E>> + Sink<M, Error = E> + Unpin,
+    M: PeerMessage,
+    E: Display,
+{
+    let me = hex::encode(state.signing_key.verifying_key().to_bytes());
     // Subscribe before taking the snapshot, so concurrent admissions are not missed.
     let mut outbound = state.gossip.subscribe();
     // Use the same lock order as block production. Replay history before pending TXs.
@@ -79,6 +97,11 @@ where
     let mut replay = state.sync.begin_replay();
     // Read while sending the snapshot, including when both peers replay at once.
     let send = async {
+        send_text(
+            &mut writer,
+            serde_json::to_string(&NodeMessage::Hello(me.clone()))?,
+        )
+        .await?;
         for block in blocks {
             let text = serde_json::to_string(&NodeMessage::NewBlock(Box::new(block)))?;
             send_text(&mut writer, text).await?;
@@ -121,22 +144,24 @@ where
                         "peer silent for {}s; disconnecting",
                         IDLE_TIMEOUT.as_secs_f32()
                     );
-                    break;
+                    break PeerExit::Disconnected;
                 }
-                Ok(None) => break,
+                Ok(None) => break PeerExit::Disconnected,
                 Ok(Some(Ok(message))) => message,
                 Ok(Some(Err(error))) => {
                     tracing::debug!(%error, "peer read failed");
-                    break;
+                    break PeerExit::Disconnected;
                 }
             };
             if message.is_close() {
-                break;
+                break PeerExit::Disconnected;
             }
             let Some(text) = message.as_text() else {
                 continue;
             };
             match serde_json::from_str::<NodeMessage>(text) {
+                Ok(NodeMessage::Hello(key)) if key == me => break PeerExit::Ourselves,
+                Ok(NodeMessage::Hello(_)) => {}
                 Ok(NodeMessage::NewTx(tx)) => submit_peer_transactions(&state, vec![tx]).await,
                 Ok(NodeMessage::NewTxs(txs)) => submit_peer_transactions(&state, txs).await,
                 Ok(NodeMessage::Ping) => {}
@@ -145,7 +170,7 @@ where
                     if let Err(error) = state.accept_peer_block(*block).await {
                         state.metrics.record_sync_reset();
                         tracing::warn!(%error, "peer block rejected; reconnect to replay history");
-                        break;
+                        break PeerExit::Disconnected;
                     }
                 }
                 Err(error) => tracing::warn!(%error, "invalid peer message"),
@@ -157,8 +182,9 @@ where
             if let Err(error) = result {
                 tracing::warn!(%error, "peer send failed; disconnecting");
             }
+            PeerExit::Disconnected
         }
-        () = receive => {}
+        exit = receive => exit,
     }
 }
 
@@ -579,5 +605,34 @@ mod tests {
         .await
         .expect("the node should drop a peer that stays silent");
         assert!(pings >= 2, "an idle node keeps pinging, got {pings}");
+    }
+
+    #[tokio::test]
+    async fn node_stops_dialing_an_address_that_leads_back_to_itself() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let node = state(1);
+        let app = crate::app(Arc::clone(&node));
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        // Like a peer announced on an address this machine also has.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::discovery::connect_peer(
+                vec![format!("ws://{address}/ws")],
+                Arc::clone(&node),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("dialing ourselves should be detected and given up");
+        // Talking to itself never counted as a peer history.
+        assert_eq!(node.sync.pending_replays(), 0);
     }
 }
