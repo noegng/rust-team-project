@@ -4,6 +4,8 @@
 # node-1..node-3, recorded by ONE samply (several samply instances exhaust the
 # kernel's perf_event_mlock_kb budget: "Failed to start profiling: mmap failed").
 # Output: target/profiles/nodes.json.gz, one process track per node.
+# macOS: samply cannot attach to a signed system binary such as bash, so each
+# node runs under its own samply instead -> target/profiles/node-N.json.gz.
 #
 # Usage: scripts/profile-nodes.sh            (TX_COUNT, BLOCK_TIME_SECS, BASE_PORT overridable)
 # View:  samply load target/profiles/nodes.json.gz
@@ -39,7 +41,7 @@ public() {
     { printf '302e020100300506032b657004220420' ; secret "$1"; } | xxd -r -p |
         openssl pkey -inform DER -pubout -outform DER | tail -c 32 | xxd -p -c 64
 }
-VALIDATORS=$(for i in $(seq $NODES); do public "$i"; done | paste -sd,)
+VALIDATORS=$(for i in $(seq $NODES); do public "$i"; done | paste -sd, -)
 
 # Empty working dir: the repo's .env must not override this setup.
 RUN_DIR=$(mktemp -d)
@@ -57,13 +59,35 @@ LAUNCHER=$RUN_DIR/launch.sh
     echo 'wait'
 } >"$LAUNCHER"
 
-samply record --save-only -o "$OUT/nodes.json.gz" -- bash "$LAUNCHER" >"$OUT/samply.log" 2>&1 &
-SAMPLY_PID=$!
+MACOS=false
+[[ $(uname) == Darwin ]] && MACOS=true
+SAMPLY_PIDS=()
+if $MACOS; then
+    for i in $(seq $NODES); do
+        (cd "$RUN_DIR" && SECRET_KEY=$(secret "$i") AUTHORIZED_VALIDATORS=$VALIDATORS \
+            PORT=$((BASE_PORT + i - 1)) BLOCK_TIME_SECS=$BLOCK_TIME_SECS RUST_LOG=${RUST_LOG:-warn} \
+            exec samply record --save-only -o "$OUT/node-$i.json.gz" -- "$NODE_BIN") \
+            >"$OUT/node-$i.log" 2>&1 &
+        SAMPLY_PIDS+=($!)
+    done
+else
+    samply record --save-only -o "$OUT/nodes.json.gz" -- bash "$LAUNCHER" >"$OUT/samply.log" 2>&1 &
+    SAMPLY_PIDS+=($!)
+fi
+
+# PIDs of the node processes themselves (macOS: found by their listening port).
+node_pids() {
+    if $MACOS; then
+        for i in $(seq $NODES); do lsof -t -iTCP:$((BASE_PORT + i - 1)) -sTCP:LISTEN 2>/dev/null || true; done
+    elif [[ -f $RUN_DIR/pids ]]; then
+        cat "$RUN_DIR/pids"
+    fi
+}
 cleanup() {
-    # Stop the nodes; the launcher then exits and samply writes the profile.
+    # Stop the nodes; samply then sees its target exit and writes the profile.
     # SIGTERM: background jobs of a script ignore SIGINT.
-    [[ -f $RUN_DIR/pids ]] && xargs kill -TERM <"$RUN_DIR/pids" 2>/dev/null || true
-    wait "$SAMPLY_PID" 2>/dev/null || true
+    node_pids | xargs kill -TERM 2>/dev/null || true
+    for pid in "${SAMPLY_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
     rm -rf "$RUN_DIR"
 }
 trap cleanup EXIT
@@ -81,7 +105,7 @@ for i in $(seq $NODES); do URLS+=("http://127.0.0.1:$((BASE_PORT + i - 1))"); do
 echo "waiting for the 3 nodes to discover each other (mDNS)..."
 min=0
 for _ in $(seq 120); do
-    kill -0 "$SAMPLY_PID" 2>/dev/null || fail "samply stopped early"
+    for pid in "${SAMPLY_PIDS[@]}"; do kill -0 "$pid" 2>/dev/null || fail "samply or a node stopped early"; done
     if [[ -f $RUN_DIR/pids ]]; then
         while read -r pid; do kill -0 "$pid" 2>/dev/null || fail "a node stopped early"; done <"$RUN_DIR/pids"
     fi
@@ -100,6 +124,12 @@ NODE_URL=${URLS[0]} METRICS_URLS=$(IFS=,; echo "${URLS[*]}") TX_COUNT=$TX_COUNT 
 
 cleanup
 trap - EXIT
-[[ -s $OUT/nodes.json.gz ]] || fail "samply wrote no profile"
-echo
-echo "view: samply load target/profiles/nodes.json.gz  (track node-N -> Flame Graph)"
+if $MACOS; then
+    for i in $(seq $NODES); do [[ -s $OUT/node-$i.json.gz ]] || fail "samply wrote no profile for node $i"; done
+    echo
+    echo "view: samply load target/profiles/node-1.json.gz  (node-2, node-3 likewise -> Flame Graph)"
+else
+    [[ -s $OUT/nodes.json.gz ]] || fail "samply wrote no profile"
+    echo
+    echo "view: samply load target/profiles/nodes.json.gz  (track node-N -> Flame Graph)"
+fi
