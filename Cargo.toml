@@ -12,3 +12,8 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 ed25519-dalek = { version = "3.0.0", features = ["serde"] }
 tokio-tungstenite = "0.30.0"
+
+# Release code with debug symbols, for samply / flamegraphs.
+[profile.profiling]
+inherits = "release"
+debug = true

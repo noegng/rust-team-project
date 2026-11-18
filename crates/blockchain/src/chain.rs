@@ -5,6 +5,9 @@ use ed25519_dalek::VerifyingKey;
 use crate::block::{Block, BlockData, BlockError};
 use crate::transaction::TransactionError;
 
+/// Nombre maximal de transactions par bloc (règle de consensus).
+pub const MAX_TXS_PER_BLOCK: usize = 20_000;
+
 /// Hash hex du bloc genesis précédent (aucun parent).
 pub const GENESIS_PREV_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -43,6 +46,9 @@ pub enum ChainError {
 
     #[error("transaction nonce overflow")]
     NonceOverflow,
+
+    #[error("too many transactions in block: max {max}, got {got}")]
+    TooManyTransactions { max: usize, got: usize },
 }
 
 /// Prochain nonce attendu, par clé publique de l'expéditeur.
@@ -141,6 +147,12 @@ impl Chain {
             return Err(ChainError::InvalidPreviousHash {
                 expected: last.block_data.hash.clone(),
                 got: data.prev_hash.clone(),
+            });
+        }
+        if data.transactions.len() > MAX_TXS_PER_BLOCK {
+            return Err(ChainError::TooManyTransactions {
+                max: MAX_TXS_PER_BLOCK,
+                got: data.transactions.len(),
             });
         }
         if data.timestamp < last.block_data.timestamp {
@@ -413,6 +425,21 @@ mod tests {
                 expected: 1,
                 got: 2
             })
+        ));
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn block_above_transaction_limit_is_rejected() {
+        let mut chain = chain();
+        // The count is checked before the TXs themselves: copies are enough.
+        let over = vec![tx(0); MAX_TXS_PER_BLOCK + 1];
+        assert!(matches!(
+            chain.push(next_block(&chain, over, &key(7))),
+            Err(ChainError::TooManyTransactions {
+                max: MAX_TXS_PER_BLOCK,
+                got
+            }) if got == MAX_TXS_PER_BLOCK + 1
         ));
         assert_eq!(chain.len(), 1);
     }

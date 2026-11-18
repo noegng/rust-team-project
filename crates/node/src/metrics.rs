@@ -11,6 +11,8 @@ pub(crate) struct Metrics {
     propagation_ms: Average,
     txs_committed: AtomicU64,
     finality_ms: Average,
+    txs_rejected: AtomicU64,
+    sync_resets: AtomicU64,
 }
 
 /// Vue sérialisable des métriques (ex. réponse de `GET /metrics`).
@@ -23,6 +25,10 @@ pub(crate) struct MetricsSnapshot {
     pub avg_finality_ms: Option<u64>,
     pub chain_len: u64,
     pub mempool_len: usize,
+    /// TX refusées par `POST /transactions` (doublon, signature invalide...).
+    pub txs_rejected: u64,
+    /// Connexions peer coupées sur un bloc rejeté (sync incohérente).
+    pub sync_resets: u64,
 }
 
 impl Metrics {
@@ -33,7 +39,18 @@ impl Metrics {
             propagation_ms: Average::default(),
             txs_committed: AtomicU64::new(0),
             finality_ms: Average::default(),
+            txs_rejected: AtomicU64::new(0),
+            sync_resets: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn record_rejected_tx(&self) {
+        self.txs_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Un peer a envoyé un bloc refusé : la connexion est coupée puis rejouée.
+    pub(crate) fn record_sync_reset(&self) {
+        self.sync_resets.fetch_add(1, Ordering::Relaxed);
     }
 
     /// TX acceptée dans le mempool (client ou gossip) :
@@ -64,6 +81,8 @@ impl Metrics {
             avg_finality_ms: self.finality_ms.get(),
             chain_len,
             mempool_len,
+            txs_rejected: self.txs_rejected.load(Ordering::Relaxed),
+            sync_resets: self.sync_resets.load(Ordering::Relaxed),
         }
     }
 
@@ -145,6 +164,20 @@ mod tests {
         assert_eq!(snapshot.txs_committed, 2);
         assert_eq!(snapshot.avg_finality_ms, Some(1_500));
         assert_eq!(snapshot.mempool_len, 3);
+    }
+
+    #[test]
+    fn counts_rejected_transactions_and_sync_resets() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.snapshot(1, 0).txs_rejected, 0);
+        assert_eq!(metrics.snapshot(1, 0).sync_resets, 0);
+        metrics.record_rejected_tx();
+        metrics.record_rejected_tx();
+        metrics.record_sync_reset();
+        let snapshot = metrics.snapshot(1, 0);
+        assert_eq!(snapshot.txs_rejected, 2);
+        assert_eq!(snapshot.sync_resets, 1);
+        assert_eq!(snapshot.txs_received, 0);
     }
 
     #[test]

@@ -100,6 +100,7 @@ where
                 Ok(NodeMessage::Ping) => {}
                 Ok(NodeMessage::NewBlock(block)) => {
                     if let Err(error) = state.accept_peer_block(*block).await {
+                        state.metrics.record_sync_reset();
                         tracing::warn!(%error, "peer block rejected; reconnect to replay history");
                         break;
                     }
