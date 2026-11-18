@@ -36,6 +36,15 @@ pub(crate) async fn discover_peers(
         let Some(peer_id) = peer.get_property_val_str("node_id") else {
             continue;
         };
+        if peer_id != node_id {
+            let mut http: Vec<_> = peer
+                .get_addresses_v4()
+                .into_iter()
+                .map(|ip| format!("http://{ip}:{}", peer.get_port()))
+                .collect();
+            http.sort();
+            state.record_peer(peer_id.to_owned(), http);
+        }
         // Only the smaller ID initiates, so each pair has one connection.
         if node_id.as_str() >= peer_id || !peers.insert(peer_id.to_owned()) {
             continue;

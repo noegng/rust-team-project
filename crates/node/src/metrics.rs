@@ -1,12 +1,16 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use blockchain::{block::Block, transaction::Transaction};
 use serde::Serialize;
 
-/// Compteurs du node, partagés via `Arc<Metrics>` sans verrou.
+/// Une rafale d'envoi se termine après ce délai sans nouvelle TX ; la suivante repart de zéro.
+const BURST_IDLE_MS: u64 = 1_000;
+
+/// Compteurs du node, partagés via `Arc<Metrics>`.
 pub(crate) struct Metrics {
-    started: Instant,
+    throughput: Throughput,
     txs_received: AtomicU64,
     propagation_ms: Average,
     txs_committed: AtomicU64,
@@ -19,7 +23,9 @@ pub(crate) struct Metrics {
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub(crate) struct MetricsSnapshot {
     pub txs_received: u64,
-    pub tps: f64,
+    /// Débit réel de la rafale en cours ou de la dernière, en TX/s :
+    /// entre la première et la dernière TX reçues. `None` si la rafale ne dure pas 1 ms.
+    pub tps: Option<f64>,
     pub avg_propagation_ms: Option<u64>,
     pub txs_committed: u64,
     pub avg_finality_ms: Option<u64>,
@@ -34,7 +40,7 @@ pub(crate) struct MetricsSnapshot {
 impl Metrics {
     pub(crate) fn new() -> Self {
         Self {
-            started: Instant::now(),
+            throughput: Throughput::default(),
             txs_received: AtomicU64::new(0),
             propagation_ms: Average::default(),
             txs_committed: AtomicU64::new(0),
@@ -67,15 +73,9 @@ impl Metrics {
 
     /// `chain_len` et `mempool_len` permettent de comparer A, B et C (lag de sync).
     pub(crate) fn snapshot(&self, chain_len: u64, mempool_len: usize) -> MetricsSnapshot {
-        let txs_received = self.txs_received.load(Ordering::Relaxed);
-        let elapsed = self.started.elapsed().as_secs_f64();
         MetricsSnapshot {
-            txs_received,
-            tps: if elapsed > 0.0 {
-                txs_received as f64 / elapsed
-            } else {
-                0.0
-            },
+            txs_received: self.txs_received.load(Ordering::Relaxed),
+            tps: self.throughput.tps(),
             avg_propagation_ms: self.propagation_ms.get(),
             txs_committed: self.txs_committed.load(Ordering::Relaxed),
             avg_finality_ms: self.finality_ms.get(),
@@ -88,6 +88,7 @@ impl Metrics {
 
     fn record_tx_at(&self, tx: &Transaction, now_ms: u64) {
         self.txs_received.fetch_add(1, Ordering::Relaxed);
+        self.throughput.record(now_ms);
         self.propagation_ms.record(age_ms(tx.timestamp, now_ms));
     }
 
@@ -96,6 +97,51 @@ impl Metrics {
             self.txs_committed.fetch_add(1, Ordering::Relaxed);
             self.finality_ms.record(age_ms(tx.timestamp, now_ms));
         }
+    }
+}
+
+/// Débit de la dernière rafale de TX reçues.
+#[derive(Default)]
+struct Throughput(Mutex<Option<Burst>>);
+
+#[derive(Clone, Copy)]
+struct Burst {
+    first_ms: u64,
+    last_ms: u64,
+    count: u64,
+}
+
+impl Throughput {
+    fn record(&self, now_ms: u64) {
+        let mut burst = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match burst.as_mut() {
+            Some(current) if now_ms <= current.last_ms + BURST_IDLE_MS => {
+                // Des réceptions concurrentes peuvent arriver légèrement dans le désordre.
+                current.last_ms = current.last_ms.max(now_ms);
+                current.count += 1;
+            }
+            _ => {
+                *burst = Some(Burst {
+                    first_ms: now_ms,
+                    last_ms: now_ms,
+                    count: 1,
+                })
+            }
+        }
+    }
+
+    /// TX/s entre la première et la dernière réception : `count - 1` intervalles
+    /// sur la durée de la rafale. Reste lisible une fois l'envoi terminé.
+    fn tps(&self) -> Option<f64> {
+        let burst = (*self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
+        let span_ms = burst.last_ms.saturating_sub(burst.first_ms);
+        (span_ms > 0).then(|| (burst.count - 1) as f64 * 1_000.0 / span_ms as f64)
     }
 }
 
@@ -159,7 +205,8 @@ mod tests {
 
         let snapshot = metrics.snapshot(2, 3);
         assert_eq!(snapshot.txs_received, 2);
-        assert!(snapshot.tps > 0.0);
+        // 1 intervalle en 200 ms.
+        assert_eq!(snapshot.tps, Some(5.0));
         assert_eq!(snapshot.avg_propagation_ms, Some(300));
         assert_eq!(snapshot.txs_committed, 2);
         assert_eq!(snapshot.avg_finality_ms, Some(1_500));

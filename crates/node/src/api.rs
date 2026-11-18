@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use blockchain::{block::Block, transaction::Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::NodeState;
 use crate::metrics::MetricsSnapshot;
@@ -33,6 +33,69 @@ pub(crate) async fn get_block(
         .cloned()
         .map(Json)
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "block not found"))
+}
+
+/// Bloc sans ses TX : assez léger pour être interrogé en boucle par le dashboard.
+#[derive(Serialize)]
+pub(crate) struct BlockSummary {
+    index: u64,
+    hash: String,
+    /// Clé publique hex du validateur ; `None` pour le genesis.
+    validator: Option<String>,
+    transactions: usize,
+    timestamp: u64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RecentBlocksQuery {
+    limit: Option<usize>,
+}
+
+const RECENT_BLOCKS_DEFAULT: usize = 20;
+const RECENT_BLOCKS_MAX: usize = 100;
+
+/// Derniers blocs, du plus récent au plus ancien.
+pub(crate) async fn get_recent_blocks(
+    State(state): State<Arc<NodeState>>,
+    Query(query): Query<RecentBlocksQuery>,
+) -> Json<Vec<BlockSummary>> {
+    let limit = query
+        .limit
+        .unwrap_or(RECENT_BLOCKS_DEFAULT)
+        .min(RECENT_BLOCKS_MAX);
+    let chain = state.chain.lock().await;
+    Json(
+        chain
+            .blocks()
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|block| BlockSummary {
+                index: block.block_data.index,
+                hash: block.block_data.hash.clone(),
+                validator: block.validator.map(|key| hex::encode(key.to_bytes())),
+                transactions: block.block_data.transactions.len(),
+                timestamp: block.block_data.timestamp,
+            })
+            .collect(),
+    )
+}
+
+#[derive(Serialize)]
+pub(crate) struct Peer {
+    node_id: String,
+    urls: Vec<String>,
+}
+
+/// Peers découverts par mDNS (sans ce node), pour que le dashboard les trouve seul.
+pub(crate) async fn get_peers(State(state): State<Arc<NodeState>>) -> Json<Vec<Peer>> {
+    Json(
+        state
+            .peers()
+            .into_iter()
+            .map(|(node_id, urls)| Peer { node_id, urls })
+            .collect(),
+    )
 }
 
 #[derive(Serialize)]
@@ -98,6 +161,8 @@ pub(crate) struct NodeMetrics {
     /// Genesis is at height 0; chain_len includes genesis.
     pub height: u64,
     pub last_block_hash: String,
+    /// Clé publique hex de ce node : relie les blocs à leur producteur.
+    pub public_key: String,
 }
 
 /// Snapshot under the same lock order as block production and reception.
@@ -108,6 +173,7 @@ pub(crate) async fn get_metrics(State(state): State<Arc<NodeState>>) -> Json<Nod
         metrics: state.metrics.snapshot(chain.len(), mempool.len()),
         height: chain.last().block_data.index,
         last_block_hash: chain.last().block_data.hash.clone(),
+        public_key: hex::encode(state.signing_key.verifying_key().to_bytes()),
     })
 }
 
@@ -309,7 +375,7 @@ mod tests {
         assert_eq!(initial["chain_len"], 1);
         assert_eq!(initial["height"], 0);
         assert_eq!(initial["last_block_hash"], genesis_hash);
-        assert_eq!(initial["tps"], 0.0);
+        assert!(initial["tps"].is_null());
         assert!(initial["avg_propagation_ms"].is_null());
         assert!(initial["avg_finality_ms"].is_null());
 
@@ -345,7 +411,8 @@ mod tests {
         assert_eq!(pending["txs_rejected"], 2);
         assert_eq!(pending["sync_resets"], 0);
         assert_eq!(pending["mempool_len"], 1);
-        assert!(pending["tps"].as_f64().unwrap() > 0.0);
+        // Une seule TX : pas de durée, donc pas de débit mesurable.
+        assert!(pending["tps"].is_null());
         assert!(pending["avg_propagation_ms"].is_u64());
 
         state.produce_next_block(2).await.unwrap();
@@ -369,6 +436,73 @@ mod tests {
             assert_eq!(committed["last_block_hash"], expected_hash);
             assert!(committed["avg_finality_ms"].is_u64());
         }
+    }
+
+    #[tokio::test]
+    async fn dashboard_routes_serve_page_block_summaries_peers_and_cors() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let tx = Transaction::new(&key.verifying_key(), 10, 0, 1, &key).unwrap();
+        let state = Arc::new(NodeState::new(key.clone(), vec![key.verifying_key()]).unwrap());
+        state.submit_transaction(tx).await.unwrap();
+        state.produce_next_block(2).await.unwrap();
+        state.produce_next_block(3).await.unwrap();
+        state.record_peer("b".into(), vec!["http://10.0.0.2:3000".into()]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::app(Arc::clone(&state));
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let get = |path: &str| client.get(format!("{base}{path}")).send();
+
+        let page = get("/").await.unwrap().error_for_status().unwrap();
+        assert!(
+            page.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert!(
+            page.text()
+                .await
+                .unwrap()
+                .contains("<title>Authora Dashboard</title>")
+        );
+
+        // Newest first, without the transactions themselves.
+        let blocks: serde_json::Value = get("/blocks?limit=2").await.unwrap().json().await.unwrap();
+        let public_key = hex::encode(key.verifying_key().to_bytes());
+        assert_eq!(blocks.as_array().unwrap().len(), 2);
+        assert_eq!(blocks[0]["index"], 2);
+        assert_eq!(blocks[0]["transactions"], 0);
+        assert_eq!(blocks[1]["index"], 1);
+        assert_eq!(blocks[1]["transactions"], 1);
+        assert_eq!(blocks[1]["validator"], public_key);
+        assert!(blocks[1].get("block_data").is_none());
+        let all: serde_json::Value = get("/blocks").await.unwrap().json().await.unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 3);
+        assert!(all[2]["validator"].is_null());
+
+        let peers: serde_json::Value = get("/peers").await.unwrap().json().await.unwrap();
+        assert_eq!(
+            peers,
+            serde_json::json!([{"node_id": "b", "urls": ["http://10.0.0.2:3000"]}])
+        );
+
+        // A dashboard served by another node may read the metrics cross-origin.
+        let metrics = client
+            .get(format!("{base}/metrics"))
+            .header("origin", "http://10.0.0.2:3000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metrics.headers()["access-control-allow-origin"], "*");
+        let metrics: serde_json::Value = metrics.json().await.unwrap();
+        assert_eq!(metrics["public_key"], public_key);
     }
 
     #[tokio::test]

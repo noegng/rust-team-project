@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authora Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f4f4f2;
+    --surface-1: #fcfcfb;
+    --border: #e2e1dc;
+    --grid: #ebeae6;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #6f6e69;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --series-4: #eda100;
+    --series-5: #e87ba4;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-0: #111110;
+      --surface-1: #1a1a19;
+      --border: #2e2e2c;
+      --grid: #2a2a28;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted: #9a998f;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --series-4: #c98500;
+      --series-5: #d55181;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #111110;
+    --surface-1: #1a1a19;
+    --border: #2e2e2c;
+    --grid: #2a2a28;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #9a998f;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; font-weight: 600; margin: 0 0 10px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .04em; }
+  .muted { color: var(--text-muted); }
+  .panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; min-width: 0; }
+
+  .status { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
+  .status .icon { width: 18px; height: 18px; border-radius: 50%; display: inline-grid; place-items: center; color: #fff; font-size: 12px; line-height: 1; }
+  .status.good .icon { background: var(--good); }
+  .status.warning .icon { background: var(--warning); color: #0b0b0b; }
+  .status.critical .icon { background: var(--critical); }
+  .status.idle .icon { background: var(--text-muted); }
+
+  .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat .value { font-size: 26px; font-weight: 650; }
+  .stat .label { color: var(--text-secondary); font-size: 12px; }
+
+  .nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .node { margin: 0; }
+  .node-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; min-width: 0; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  .node-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .node-key { margin-left: auto; font-family: ui-monospace, monospace; font-size: 12px; }
+  .node.down { opacity: .55; }
+  dl { display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; margin: 0; }
+  dt { color: var(--text-secondary); }
+  dd { margin: 0; text-align: right; font-weight: 600; }
+
+  .chart-wrap { position: relative; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-bottom: 8px; color: var(--text-secondary); font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  svg { display: block; width: 100%; height: 240px; overflow: visible; touch-action: none; }
+  svg text { fill: var(--text-muted); font-size: 11px; }
+  svg .direct { fill: var(--text-secondary); font-weight: 600; }
+  .tooltip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgb(0 0 0 / .12); white-space: nowrap; display: none; z-index: 2; }
+  .tooltip .row { display: flex; align-items: center; gap: 6px; }
+  .tooltip strong { min-width: 56px; text-align: right; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--text-secondary); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; }
+  td.hash { font-family: ui-monospace, monospace; font-size: 12px; }
+  .table-scroll { overflow-x: auto; }
+  .proposer { display: inline-flex; align-items: center; gap: 6px; }
+  tr.fresh td { background: color-mix(in srgb, var(--series-1) 10%, transparent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Authora</h1>
+    <span id="consensus" class="status idle"><span class="icon" aria-hidden="true">…</span><span class="text">Connexion aux nodes…</span></span>
+    <span id="source" class="muted"></span>
+  </header>
+
+  <section class="panel totals" aria-label="Vue d'ensemble du réseau">
+    <div class="stat"><div class="value" id="total-height">–</div><div class="label">Hauteur de la chaîne</div></div>
+    <div class="stat"><div class="value" id="total-rate">–</div><div class="label">TX reçues/s maintenant (max des nodes)</div></div>
+    <div class="stat"><div class="value" id="total-committed">–</div><div class="label">TX incluses dans un bloc</div></div>
+    <div class="stat"><div class="value" id="total-pending">–</div><div class="label">TX en attente (plus gros mempool)</div></div>
+  </section>
+
+  <section class="nodes" id="nodes" aria-label="Nodes"></section>
+
+  <section class="panel">
+    <h2>TX reçues par seconde, par node (60 dernières secondes)</h2>
+    <div class="legend" id="legend"></div>
+    <div class="chart-wrap" id="chart-wrap">
+      <svg id="chart" role="img" aria-label="TX reçues par seconde pour chaque node"></svg>
+      <div class="tooltip" id="tooltip" role="status"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Derniers blocs</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th class="num">Bloc</th><th>Produit par</th><th class="num">TX</th><th>Hash</th><th class="num">Il y a</th></tr></thead>
+        <tbody id="blocks"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const POLL_MS = 1000;
+const PEERS_MS = 5000;
+const WINDOW_MS = 60_000;
+const SERIES = 5;
+// Un bloc toutes les 2 s par défaut : 10 s sans progrès signale un blocage.
+const STALL_MS = 10_000;
+const fmt = new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 });
+const fmtAxis = new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 1 });
+
+// `?nodes=http://ip:3000,http://ip:3000` fixe la liste ; sinon ce node + ses peers mDNS.
+const params = new URLSearchParams(location.search);
+const fixedNodes = (params.get("nodes") || "")
+  .split(",").map((url) => url.trim().replace(/\/+$/, "")).filter(Boolean);
+
+/** id → { id, candidates, url, slot, metrics, prev, error, el } */
+const nodes = new Map();
+/** Un relevé par tour : { t, rates: Map(id → TX/s | null) } */
+const history = [];
+let blocks = [];
+let lastBlockIndex = null;
+let hoverX = null;
+/** Dernière hauteur max vue et depuis quand elle n'a pas bougé. */
+let topHeight = null;
+let topSince = Date.now();
+
+function addNode(id, candidates) {
+  if (nodes.has(id)) {
+    nodes.get(id).candidates = candidates;
+    return;
+  }
+  // La couleur suit le node pour toute la session : jamais réattribuée.
+  const node = { id, candidates, url: null, slot: nodes.size % SERIES + 1, metrics: null, prev: null, error: null, el: null, behindSince: null };
+  nodes.set(id, node);
+  renderNodeCard(node);
+}
+
+if (fixedNodes.length) {
+  fixedNodes.forEach((url) => addNode(url, [url]));
+  document.getElementById("source").textContent = "nodes fixés par l'URL";
+} else {
+  addNode("self", [location.origin]);
+  document.getElementById("source").textContent = "nodes découverts par mDNS";
+}
+
+async function getJson(url) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(2000), cache: "no-store" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+async function refreshPeers() {
+  if (fixedNodes.length) return;
+  try {
+    for (const peer of await getJson(`${location.origin}/peers`)) {
+      addNode(peer.node_id, peer.urls);
+    }
+  } catch { /* le node local est déjà signalé injoignable par le relevé */ }
+}
+
+async function pollNode(node, now) {
+  const urls = node.url ? [node.url] : node.candidates;
+  for (const url of urls) {
+    try {
+      const metrics = await getJson(`${url}/metrics`);
+      node.url = url;
+      node.error = null;
+      let rate = null;
+      if (node.prev && now > node.prev.t) {
+        rate = Math.max(0, (metrics.txs_received - node.prev.received) * 1000 / (now - node.prev.t));
+      }
+      node.prev = { t: now, received: metrics.txs_received };
+      node.metrics = metrics;
+      return rate;
+    } catch (error) {
+      node.error = error.name === "TimeoutError" ? "délai dépassé" : "injoignable";
+    }
+  }
+  // Une autre IP du peer répondra peut-être au prochain tour.
+  node.url = null;
+  node.prev = null;
+  return null;
+}
+
+/** Un même node peut être trouvé deux fois (deux IP) : on garde le premier. */
+function visibleNodes() {
+  const seen = new Set();
+  return [...nodes.values()].filter((node) => {
+    const key = node.metrics?.public_key;
+    if (!key) return true;
+    if (seen.has(key)) {
+      node.el.hidden = true;
+      return false;
+    }
+    seen.add(key);
+    node.el.hidden = false;
+    return true;
+  });
+}
+
+function label(node) {
+  if (node.url) return new URL(node.url).host;
+  return node.candidates[0] ? new URL(node.candidates[0]).host : node.id;
+}
+
+function renderNodeCard(node) {
+  const card = document.createElement("article");
+  card.className = "panel node";
+  const head = document.createElement("div");
+  head.className = "node-head";
+  const swatch = document.createElement("span");
+  swatch.className = "swatch";
+  swatch.style.background = `var(--series-${node.slot})`;
+  const name = document.createElement("span");
+  name.className = "node-name";
+  const key = document.createElement("span");
+  key.className = "node-key muted";
+  head.append(swatch, name, key);
+  const list = document.createElement("dl");
+  const fields = {};
+  for (const [field, text] of [
+    ["state", "État"], ["rate", "TX reçues/s maintenant"], ["tps", "Débit du dernier envoi"],
+    ["received", "TX reçues"], ["committed", "TX incluses"], ["mempool", "Mempool"],
+    ["height", "Hauteur"], ["propagation", "Propagation moy."], ["finality", "Finalité moy."],
+  ]) {
+    const dt = document.createElement("dt");
+    dt.textContent = text;
+    const dd = document.createElement("dd");
+    list.append(dt, dd);
+    fields[field] = dd;
+  }
+  card.append(head, list);
+  document.getElementById("nodes").append(card);
+  node.el = card;
+  node.fields = fields;
+  node.nameEl = name;
+  node.keyEl = key;
+}
+
+function updateCards(latest) {
+  for (const node of nodes.values()) {
+    const m = node.metrics;
+    const f = node.fields;
+    node.nameEl.textContent = label(node);
+    node.keyEl.textContent = m ? `${m.public_key.slice(0, 8)}…` : "";
+    node.el.classList.toggle("down", Boolean(node.error));
+    f.state.textContent = node.error ? `⚠ ${node.error}` : m ? "✓ en ligne" : "…";
+    const rate = latest.get(node.id);
+    f.rate.textContent = rate == null ? "–" : fmt.format(rate);
+    f.tps.textContent = m?.tps == null ? "–" : `${fmt.format(m.tps)} TX/s`;
+    f.received.textContent = m ? fmt.format(m.txs_received) : "–";
+    f.committed.textContent = m ? fmt.format(m.txs_committed) : "–";
+    f.mempool.textContent = m ? fmt.format(m.mempool_len) : "–";
+    f.height.textContent = m ? fmt.format(m.height) : "–";
+    f.propagation.textContent = m?.avg_propagation_ms == null ? "–" : `${fmt.format(m.avg_propagation_ms)} ms`;
+    f.finality.textContent = m?.avg_finality_ms == null ? "–" : `${fmt.format(m.avg_finality_ms)} ms`;
+  }
+}
+
+function setStatus(kind, icon, text) {
+  const el = document.getElementById("consensus");
+  el.className = `status ${kind}`;
+  el.querySelector(".icon").textContent = icon;
+  el.querySelector(".text").textContent = text;
+}
+
+function updateConsensus(live) {
+  if (live.length === 0) return setStatus("critical", "!", "Aucun node joignable");
+  const now = Date.now();
+  const top = Math.max(...live.map((node) => node.metrics.height));
+  if (top !== topHeight) {
+    topHeight = top;
+    topSince = now;
+  }
+  for (const node of live) {
+    if (node.metrics.height < top) node.behindSince ??= now;
+    else node.behindSince = null;
+  }
+  const seconds = (since) => fmt.format((now - since) / 1000);
+
+  // Un node resté sous la tête trop longtemps n'accepte pas le bloc suivant.
+  const stuck = live.filter((node) => node.behindSince != null && now - node.behindSince > STALL_MS);
+  if (stuck.length) {
+    const low = Math.min(...stuck.map((node) => node.metrics.height));
+    const since = Math.min(...stuck.map((node) => node.behindSince));
+    return setStatus("critical", "✕",
+      `Bloqués au bloc #${low} depuis ${seconds(since)} s : ${stuck.map(label).join(", ")} (bloc #${top} non accepté)`);
+  }
+  const atTop = live.filter((node) => node.metrics.height === top);
+  if (new Set(atTop.map((node) => node.metrics.last_block_hash)).size > 1) {
+    return setStatus("critical", "✕", `Divergence : hashes différents au bloc #${top}`);
+  }
+  if (now - topSince > STALL_MS) {
+    return setStatus("warning", "!", `Aucun nouveau bloc depuis ${seconds(topSince)} s (bloc #${top})`);
+  }
+  if (atTop.length < live.length) {
+    // Les relevés ne sont pas simultanés : un retard bref est normal pendant la propagation.
+    return setStatus("good", "✓", `Synchronisation en cours (bloc #${top})`);
+  }
+  const count = live.length === 1 ? "1 node" : `${live.length} nodes`;
+  return setStatus("good", "✓", `Synchronisés : ${count} sur le bloc #${top}`);
+}
+
+function updateTotals(live, latest) {
+  const max = (values) => (values.length ? Math.max(...values) : null);
+  const show = (id, value) => {
+    document.getElementById(id).textContent = value == null ? "–" : fmt.format(value);
+  };
+  show("total-height", max(live.map((node) => node.metrics.height)));
+  show("total-rate", max(live.map((node) => latest.get(node.id)).filter((rate) => rate != null)));
+  show("total-committed", max(live.map((node) => node.metrics.txs_committed)));
+  show("total-pending", max(live.map((node) => node.metrics.mempool_len)));
+}
+
+async function refreshBlocks(live) {
+  const source = live.find((node) => node.id === "self") || live[0];
+  if (!source) return;
+  try {
+    blocks = await getJson(`${source.url}/blocks?limit=12`);
+  } catch {
+    return;
+  }
+  const owners = new Map(live.map((node) => [node.metrics.public_key, node]));
+  const body = document.getElementById("blocks");
+  const now = Date.now() / 1000;
+  const newest = blocks[0]?.index ?? null;
+  const rows = blocks.map((block) => {
+    const tr = document.createElement("tr");
+    if (lastBlockIndex != null && block.index > lastBlockIndex) tr.className = "fresh";
+    const cell = (text, className) => {
+      const td = document.createElement("td");
+      if (className) td.className = className;
+      td.textContent = text;
+      tr.append(td);
+      return td;
+    };
+    cell(`#${block.index}`, "num");
+    const who = cell("", "");
+    const owner = owners.get(block.validator);
+    const span = document.createElement("span");
+    span.className = "proposer";
+    if (owner) {
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = `var(--series-${owner.slot})`;
+      span.append(swatch, document.createTextNode(label(owner)));
+    } else {
+      span.textContent = block.validator ? `${block.validator.slice(0, 8)}…` : "genesis";
+    }
+    who.append(span);
+    cell(fmt.format(block.transactions), "num");
+    cell(`${block.hash.slice(0, 16)}…`, "hash");
+    cell(block.index === 0 ? "–" : `${fmt.format(Math.max(0, now - block.timestamp))} s`, "num");
+    return tr;
+  });
+  body.replaceChildren(...rows);
+  if (newest != null) lastBlockIndex = newest;
+}
+
+// ---- Graphique : une ligne par node, réticule + infobulle au survol ----
+
+const svgNs = "http://www.w3.org/2000/svg";
+const chart = document.getElementById("chart");
+const tooltip = document.getElementById("tooltip");
+const margin = { top: 10, right: 120, bottom: 24, left: 52 };
+
+function el(name, attrs, text) {
+  const node = document.createElementNS(svgNs, name);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function niceMax(value) {
+  if (value <= 10) return 10;
+  const step = 10 ** Math.floor(Math.log10(value));
+  for (const factor of [1, 2, 2.5, 5, 10]) {
+    if (value <= factor * step) return factor * step;
+  }
+  return 10 * step;
+}
+
+function drawChart() {
+  const width = chart.clientWidth;
+  const height = chart.clientHeight;
+  const plotW = Math.max(10, width - margin.left - margin.right);
+  const plotH = height - margin.top - margin.bottom;
+  const now = history.length ? history[history.length - 1].t : Date.now();
+  const start = now - WINDOW_MS;
+  const shown = visibleNodes();
+  let peak = 0;
+  for (const round of history) {
+    for (const node of shown) peak = Math.max(peak, round.rates.get(node.id) ?? 0);
+  }
+  const yMax = niceMax(peak);
+  const x = (t) => margin.left + ((t - start) / WINDOW_MS) * plotW;
+  const y = (v) => margin.top + plotH - (v / yMax) * plotH;
+
+  const parts = [];
+  for (let i = 0; i <= 4; i++) {
+    const value = (yMax / 4) * i;
+    parts.push(el("line", { x1: margin.left, x2: margin.left + plotW, y1: y(value), y2: y(value), stroke: "var(--grid)", "stroke-width": 1 }));
+    parts.push(el("text", { x: margin.left - 8, y: y(value) + 4, "text-anchor": "end" }, fmtAxis.format(value)));
+  }
+  for (const seconds of [60, 45, 30, 15, 0]) {
+    const anchor = seconds === 60 ? "start" : seconds === 0 ? "end" : "middle";
+    parts.push(el("text", { x: x(now - seconds * 1000), y: height - 6, "text-anchor": anchor }, seconds ? `-${seconds} s` : "maintenant"));
+  }
+
+  const ends = [];
+  for (const node of shown) {
+    let d = "";
+    let penDown = false;
+    let last = null;
+    for (const round of history) {
+      const value = round.rates.get(node.id);
+      if (value == null) { penDown = false; continue; }
+      d += `${penDown ? "L" : "M"}${x(round.t).toFixed(1)},${y(value).toFixed(1)}`;
+      penDown = true;
+      last = { t: round.t, value };
+    }
+    if (!d) continue;
+    parts.push(el("path", { d, fill: "none", stroke: `var(--series-${node.slot})`, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    if (last) ends.push({ node, y: y(last.value), x: x(last.t), value: last.value });
+  }
+
+  // Étiquettes directes en bout de ligne, écartées pour ne pas se chevaucher.
+  ends.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++) ends[i].y = Math.max(ends[i].y, ends[i - 1].y + 14);
+  // Puis remontées si elles dépassent le bas du graphique.
+  for (let i = ends.length - 1; i >= 0; i--) {
+    const floor = i === ends.length - 1 ? margin.top + plotH : ends[i + 1].y - 14;
+    ends[i].y = Math.min(ends[i].y, floor);
+  }
+  for (const end of ends) {
+    parts.push(el("text", { x: end.x + 8, y: end.y + 4, class: "direct" }, label(end.node)));
+  }
+
+  if (hoverX != null && history.length) {
+    const t = start + ((hoverX - margin.left) / plotW) * WINDOW_MS;
+    const round = history.reduce((best, r) => (Math.abs(r.t - t) < Math.abs(best.t - t) ? r : best));
+    const cx = x(round.t);
+    parts.push(el("line", { x1: cx, x2: cx, y1: margin.top, y2: margin.top + plotH, stroke: "var(--text-muted)", "stroke-width": 1 }));
+    tooltip.replaceChildren();
+    const when = document.createElement("div");
+    when.className = "muted";
+    when.textContent = `il y a ${fmt.format((now - round.t) / 1000)} s`;
+    tooltip.append(when);
+    for (const node of shown) {
+      const value = round.rates.get(node.id);
+      if (value != null) {
+        parts.push(el("circle", { cx, cy: y(value), r: 4, fill: `var(--series-${node.slot})`, stroke: "var(--surface-1)", "stroke-width": 2 }));
+      }
+      const row = document.createElement("div");
+      row.className = "row";
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = `var(--series-${node.slot})`;
+      const strong = document.createElement("strong");
+      strong.textContent = value == null ? "–" : fmt.format(value);
+      row.append(swatch, strong, document.createTextNode(` TX/s · ${label(node)}`));
+      tooltip.append(row);
+    }
+    tooltip.style.display = "block";
+    const left = cx + 12 + tooltip.offsetWidth > width ? cx - 12 - tooltip.offsetWidth : cx + 12;
+    tooltip.style.left = `${Math.max(0, left)}px`;
+    tooltip.style.top = `${margin.top}px`;
+  } else {
+    tooltip.style.display = "none";
+  }
+
+  parts.push(el("rect", { x: margin.left, y: margin.top, width: plotW, height: plotH, fill: "transparent", class: "hit" }));
+  chart.replaceChildren(...parts);
+
+  const legend = document.getElementById("legend");
+  legend.replaceChildren(...shown.map((node) => {
+    const item = document.createElement("span");
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = `var(--series-${node.slot})`;
+    item.append(swatch, document.createTextNode(label(node)));
+    return item;
+  }));
+}
+
+chart.addEventListener("pointermove", (event) => {
+  const box = chart.getBoundingClientRect();
+  const xPos = event.clientX - box.left;
+  hoverX = xPos >= margin.left && xPos <= box.width - margin.right ? xPos : null;
+  drawChart();
+});
+chart.addEventListener("pointerleave", () => { hoverX = null; drawChart(); });
+window.addEventListener("resize", drawChart);
+
+async function tick() {
+  const now = Date.now();
+  const all = [...nodes.values()];
+  const rates = await Promise.all(all.map((node) => pollNode(node, now)));
+  const latest = new Map(all.map((node, i) => [node.id, rates[i]]));
+  history.push({ t: now, rates: latest });
+  while (history.length && history[0].t < now - WINDOW_MS) history.shift();
+
+  const live = visibleNodes().filter((node) => node.metrics && !node.error);
+  updateCards(latest);
+  updateTotals(live, latest);
+  updateConsensus(live);
+  drawChart();
+  await refreshBlocks(live);
+}
+
+async function loop() {
+  await tick();
+  setTimeout(loop, POLL_MS);
+}
+
+refreshPeers();
+setInterval(refreshPeers, PEERS_MS);
+loop();
+</script>
+</body>
+</html>
