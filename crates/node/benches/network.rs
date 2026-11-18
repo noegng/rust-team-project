@@ -3,6 +3,7 @@
 //!
 //! Run: `cargo bench -p node --features testnet`
 //! Stress only: `cargo bench -p node --features testnet -- stress`
+//! Live dashboard: `DASHBOARD_PORT=3200 cargo bench ...`, then open the printed URL.
 //! Quick check: `cargo bench -p node --features testnet -- --test`
 //!
 //! Criterion measures the wall time; the network statistics it cannot express
@@ -39,6 +40,19 @@ const STRESS_START_TPS: f64 = 5_000.0;
 const STRESS_GROWTH: f64 = 1.5;
 const STRESS_MAX_STEPS: usize = 12;
 const MAX_ERROR_RATE: f64 = 0.01;
+
+/// `DASHBOARD_PORT=3200`: every network listens on 3200.. so one browser tab
+/// on the printed dashboard URL follows all runs live.
+fn dashboard_port() -> Option<u16> {
+    let port = std::env::var("DASHBOARD_PORT").ok()?;
+    Some(port.parse().expect("DASHBOARD_PORT must be a port number"))
+}
+
+async fn spawn_network(block_time: Duration) -> Testnet {
+    Testnet::spawn_on(VALIDATORS, block_time, dashboard_port())
+        .await
+        .expect("testnet starts")
+}
 
 /// One measured iteration.
 #[derive(Default)]
@@ -80,9 +94,7 @@ async fn load_until_synced(count: u64, rogue_blocks: u64) -> Run {
 /// `senders` concurrent load tasks (one key each, `per_sender` TXs), spread
 /// round-robin over the nodes: sender 0 targets node 0.
 async fn load_until_synced_from(senders: u64, per_sender: u64, rogue_blocks: u64) -> Run {
-    let network = Testnet::spawn(VALIDATORS, BLOCK_TIME)
-        .await
-        .expect("testnet starts");
+    let network = spawn_network(BLOCK_TIME).await;
     let started = Instant::now();
     let loaders = spawn_loaders(&network, senders, per_sender, None);
     for _ in 0..rogue_blocks {
@@ -185,9 +197,7 @@ fn bench_bad_sync(c: &mut Criterion, runtime: &Runtime) {
     let id = "bad_sync/reset_on_bad_block";
     group.bench_function("reset_on_bad_block", |b| {
         b.to_async(runtime).iter_custom(|iters| async move {
-            let network = Testnet::spawn(VALIDATORS, BLOCK_TIME)
-                .await
-                .expect("testnet starts");
+            let network = spawn_network(BLOCK_TIME).await;
             let mut total = Duration::ZERO;
             for _ in 0..iters {
                 let before = network.stats(1).await.sync_resets;
@@ -245,9 +255,7 @@ fn bench_catch_up(c: &mut Criterion, runtime: &Runtime) {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     // Setup, not measured: a chain holding CHAIN_TXS TXs.
-                    let mut network = Testnet::spawn(VALIDATORS, BLOCK_TIME)
-                        .await
-                        .expect("testnet starts");
+                    let mut network = spawn_network(BLOCK_TIME).await;
                     let load = Load {
                         sender: sender_key(CHAIN_TXS),
                         count: CHAIN_TXS,
@@ -289,9 +297,7 @@ fn bench_catch_up(c: &mut Criterion, runtime: &Runtime) {
 /// senders, then STRESS_SETTLE for every node to commit. Never panics on
 /// overload: what is not committed everywhere by then is counted as lost.
 async fn stress_step(offered_tps: f64) -> Run {
-    let network = Testnet::spawn(VALIDATORS, STRESS_BLOCK_TIME)
-        .await
-        .expect("testnet starts");
+    let network = spawn_network(STRESS_BLOCK_TIME).await;
     let per_sender_tps = offered_tps / STRESS_SENDERS as f64;
     let per_sender = (per_sender_tps * STRESS_STEP.as_secs_f64()).round() as u64;
     let started = Instant::now();
@@ -525,6 +531,12 @@ fn main() {
         .enable_all()
         .build()
         .expect("tokio runtime");
+    if let Some(base) = dashboard_port() {
+        let nodes: Vec<_> = (0..VALIDATORS as u16)
+            .map(|node| format!("http://127.0.0.1:{}", base + node))
+            .collect();
+        println!("dashboard: {}/?nodes={}", nodes[0], nodes.join(","));
+    }
     let mut criterion = Criterion::default().configure_from_args();
     bench_sync(&mut criterion, &runtime);
     bench_bad_sync(&mut criterion, &runtime);
