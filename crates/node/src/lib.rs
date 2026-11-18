@@ -168,9 +168,12 @@ impl NodeState {
 
 /// Runs CPU-bound work (signature checks) off the async workers.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-    tokio::task::spawn_blocking(work)
-        .await
-        .expect("blocking task panicked")
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        // Cancelled: only while the runtime shuts down, which drops this task next.
+        Err(_) => std::future::pending().await,
+    }
 }
 
 /// Dashboard live : interroge ce node et ses peers depuis le navigateur.
