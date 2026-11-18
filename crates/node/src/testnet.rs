@@ -46,12 +46,26 @@ pub struct NodeStats {
     pub sync_resets: u64,
     pub avg_propagation_ms: Option<u64>,
     pub avg_finality_ms: Option<u64>,
+    /// Largest number of TXs in one block of the local chain.
+    pub max_block_txs: u64,
 }
 
 impl Testnet {
     /// Starts `size` validators (keys seeded `1..=size`), fully meshed:
     /// node `i` dials every node `j > i`, like mDNS discovery does.
+    /// Ports are picked by the OS; see [`Testnet::spawn_on`] for fixed ones.
     pub async fn spawn(size: u8, block_time: Duration) -> anyhow::Result<Self> {
+        Self::spawn_on(size, block_time, None).await
+    }
+
+    /// Like [`Testnet::spawn`]; with `Some(base)`, node `i` listens on
+    /// `127.0.0.1:base + i`, so a dashboard opened on [`Testnet::dashboard_url`]
+    /// keeps following the next network started on the same ports.
+    pub async fn spawn_on(
+        size: u8,
+        block_time: Duration,
+        base_port: Option<u16>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(size > 0, "a testnet needs at least one validator");
         anyhow::ensure!(!block_time.is_zero(), "block time must be positive");
         let keys: Vec<_> = (1..=size).map(validator_key).collect();
@@ -62,11 +76,18 @@ impl Testnet {
             tasks: JoinSet::new(),
         };
         let mut listeners = Vec::new();
-        for key in keys {
-            let (listener, node) = network.bind(key).await?;
+        for (index, key) in keys.into_iter().enumerate() {
+            let port = match base_port {
+                Some(base) => base
+                    .checked_add(index as u16)
+                    .ok_or_else(|| anyhow::anyhow!("port overflow from base {base}"))?,
+                None => 0,
+            };
+            let (listener, node) = network.bind(key, port).await?;
             network.nodes.push(node);
             listeners.push(listener);
         }
+        network.introduce_peers();
         for (index, listener) in listeners.into_iter().enumerate() {
             let peers = network.nodes[index + 1..]
                 .iter()
@@ -83,16 +104,38 @@ impl Testnet {
     /// Adds a node that only replays and relays (no block production),
     /// connected to `peer`. Returns its index.
     pub async fn spawn_follower(&mut self, peer: usize) -> anyhow::Result<usize> {
-        let (listener, node) = self.bind(validator_key(1)).await?;
+        let (listener, node) = self.bind(validator_key(1), 0).await?;
         let state = Arc::clone(&node.state);
         let peers = vec![ws_url(self.nodes[peer].address)];
         self.tasks.spawn(run_node(listener, state, peers, None));
         self.nodes.push(node);
+        self.introduce_peers();
         Ok(self.nodes.len() - 1)
     }
 
-    async fn bind(&self, key: SigningKey) -> anyhow::Result<(TcpListener, TestNode)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+    /// What mDNS does for real nodes: every node lists the others in
+    /// `GET /peers`, which the dashboard served on `/` follows.
+    fn introduce_peers(&self) {
+        for (index, node) in self.nodes.iter().enumerate() {
+            for (other, peer) in self.nodes.iter().enumerate() {
+                if other != index {
+                    node.state.record_peer(
+                        format!("node-{}", other + 1),
+                        vec![format!("http://{}", peer.address)],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Live dashboard of node 0, pinned to every node of this network.
+    pub fn dashboard_url(&self) -> String {
+        let nodes: Vec<_> = (0..self.len()).map(|node| self.http_url(node)).collect();
+        format!("{}/?nodes={}", self.http_url(0), nodes.join(","))
+    }
+
+    async fn bind(&self, key: SigningKey, port: u16) -> anyhow::Result<(TcpListener, TestNode)> {
+        let listener = bind_retrying(port).await?;
         let node = TestNode {
             address: listener.local_addr()?,
             state: Arc::new(NodeState::new(key, self.validators.clone())?),
@@ -131,6 +174,12 @@ impl Testnet {
             sync_resets: metrics.sync_resets,
             avg_propagation_ms: metrics.avg_propagation_ms,
             avg_finality_ms: metrics.avg_finality_ms,
+            max_block_txs: chain
+                .blocks()
+                .iter()
+                .map(|block| block.block_data.transactions.len() as u64)
+                .max()
+                .unwrap_or(0),
         }
     }
 
@@ -149,7 +198,7 @@ impl Testnet {
         committed_txs: u64,
         timeout: Duration,
     ) -> anyhow::Result<Duration> {
-        wait_for(timeout, "network sync", async || {
+        let result = wait_for(timeout, "network sync", async || {
             let mut min_len = u64::MAX;
             for node in 0..self.len() {
                 let stats = self.stats(node).await;
@@ -166,7 +215,28 @@ impl Testnet {
             }
             true
         })
-        .await
+        .await;
+        match result {
+            Ok(elapsed) => Ok(elapsed),
+            Err(error) => {
+                let mut nodes = Vec::new();
+                for node in 0..self.len() {
+                    nodes.push(self.stats(node).await);
+                }
+                Err(error.context(format!(
+                    "expected {committed_txs} committed TXs; nodes: {nodes:?}"
+                )))
+            }
+        }
+    }
+
+    /// TXs committed on every node (the smallest local count).
+    pub async fn committed_everywhere(&self) -> u64 {
+        let mut committed = u64::MAX;
+        for node in 0..self.len() {
+            committed = committed.min(self.stats(node).await.committed_txs);
+        }
+        committed
     }
 
     /// Waits until `node` has at least `chain_len` blocks.
@@ -209,6 +279,24 @@ impl Testnet {
         .await
         .map_err(|_| anyhow::anyhow!("node kept the connection after a bad block"))?;
         Ok(started.elapsed())
+    }
+}
+
+/// A fixed port may still be held for a moment by the previous network,
+/// whose tasks are aborted when it is dropped: retry for up to 2 s.
+async fn bind_retrying(port: u16) -> std::io::Result<TcpListener> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Err(error)
+                if port != 0
+                    && error.kind() == std::io::ErrorKind::AddrInUse
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -279,11 +367,16 @@ pub fn sender_key(id: u64) -> SigningKey {
 /// What the load generator sends: `count` valid TXs with nonces `0..count`,
 /// in requests of `batch_size`. With `forged_every = Some(k)`, every k-th TX
 /// is followed by a tampered copy that the node must reject.
+///
+/// `per_second: None` waits for each response before the next request (closed
+/// loop). `Some(rate)` sends batches on a fixed schedule without waiting
+/// (open loop): an overloaded node then shows up as errors, not as a slower client.
 pub struct Load {
     pub sender: SigningKey,
     pub count: u64,
     pub batch_size: u64,
     pub forged_every: Option<u64>,
+    pub per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -317,6 +410,8 @@ pub async fn send_load(url: &str, load: Load) -> LoadReport {
         .expect("static reqwest configuration");
     let recipient = validator_key(200).verifying_key();
     let batch_size = load.batch_size.max(1);
+    let mut requests = JoinSet::new();
+    let mut nonce_sent = 0;
     let mut nonce = 0;
     while nonce < load.count {
         let end = (nonce + batch_size).min(load.count);
@@ -325,7 +420,10 @@ pub async fn send_load(url: &str, load: Load) -> LoadReport {
             // Timestamp set at send time: nodes measure propagation and finality from it.
             let tx = Transaction::new(&recipient, 1, nonce, unix_millis(), &load.sender)
                 .expect("signing a transaction cannot fail");
-            if load.forged_every.is_some_and(|k| k > 0 && (nonce + 1) % k == 0) {
+            if load
+                .forged_every
+                .is_some_and(|k| k > 0 && (nonce + 1) % k == 0)
+            {
                 let mut forged = tx.clone();
                 forged.amount += 1;
                 batch.push(tx);
@@ -336,31 +434,64 @@ pub async fn send_load(url: &str, load: Load) -> LoadReport {
         }
         nonce = end;
         report.submitted += batch.len() as u64;
-        let response = client
-            .post(format!("{url}/transactions"))
-            .json(&batch)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status);
-        let results = match response {
-            Ok(response) => response.json::<Vec<serde_json::Value>>().await.ok(),
-            Err(_) => None,
-        };
-        match results {
-            Some(results) if results.len() == batch.len() => {
-                for result in results {
-                    if result["status"] == "accepted" {
-                        report.accepted += 1;
-                    } else {
-                        report.rejected += 1;
-                    }
-                }
+        match load.per_second {
+            None => report.add(post_batch(&client, url, batch).await),
+            Some(rate) => {
+                let due = started + Duration::from_secs_f64(nonce_sent as f64 / rate);
+                tokio::time::sleep_until(due.into()).await;
+                let (client, url) = (client.clone(), url.to_string());
+                requests.spawn(async move { post_batch(&client, &url, batch).await });
             }
-            _ => report.failed += batch.len() as u64,
         }
+        nonce_sent = end;
+    }
+    while let Some(outcome) = requests.join_next().await {
+        report.add(outcome.expect("request task"));
     }
     report.elapsed = started.elapsed();
     report
+}
+
+impl LoadReport {
+    fn add(&mut self, outcome: BatchOutcome) {
+        self.accepted += outcome.accepted;
+        self.rejected += outcome.rejected;
+        self.failed += outcome.failed;
+    }
+}
+
+#[derive(Default)]
+struct BatchOutcome {
+    accepted: u64,
+    rejected: u64,
+    failed: u64,
+}
+
+async fn post_batch(client: &reqwest::Client, url: &str, batch: Vec<Transaction>) -> BatchOutcome {
+    let response = client
+        .post(format!("{url}/transactions"))
+        .json(&batch)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status);
+    let results = match response {
+        Ok(response) => response.json::<Vec<serde_json::Value>>().await.ok(),
+        Err(_) => None,
+    };
+    let mut outcome = BatchOutcome::default();
+    match results {
+        Some(results) if results.len() == batch.len() => {
+            for result in results {
+                if result["status"] == "accepted" {
+                    outcome.accepted += 1;
+                } else {
+                    outcome.rejected += 1;
+                }
+            }
+        }
+        _ => outcome.failed = batch.len() as u64,
+    }
+    outcome
 }
 
 fn unix_millis() -> u64 {
@@ -382,6 +513,7 @@ mod tests {
             count,
             batch_size: 50,
             forged_every: None,
+            per_second: None,
         }
     }
 
@@ -435,6 +567,97 @@ mod tests {
             assert_eq!(stats.sync_resets, 0);
             assert!(stats.avg_propagation_ms.is_some());
             assert!(stats.avg_finality_ms.is_some());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paced_load_keeps_its_schedule_and_syncs() {
+        let network = Testnet::spawn(3, BLOCK_TIME).await.unwrap();
+        // 300 TX at 1000 TX/s in batches of 50: the last batch leaves at 250 ms.
+        let report = send_load(
+            &network.http_url(0),
+            Load {
+                per_second: Some(1_000.0),
+                ..load(5, 300)
+            },
+        )
+        .await;
+        assert_eq!(report.accepted, 300);
+        assert_eq!(report.error_rate(), 0.0);
+        assert!(report.elapsed >= Duration::from_millis(250));
+        network.wait_until_synced(300, TIMEOUT).await.unwrap();
+        assert_eq!(network.committed_everywhere().await, 300);
+    }
+
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(TIMEOUT)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dashboard_of_any_node_sees_the_whole_testnet() {
+        let mut network = Testnet::spawn(3, BLOCK_TIME).await.unwrap();
+        let follower = network.spawn_follower(0).await.unwrap();
+        let client = http_client();
+        for node in 0..network.len() {
+            let peers: Vec<serde_json::Value> = client
+                .get(format!("{}/peers", network.http_url(node)))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let mut urls: Vec<_> = peers
+                .iter()
+                .map(|peer| peer["urls"][0].as_str().unwrap().to_string())
+                .collect();
+            urls.sort();
+            let mut expected: Vec<_> = (0..network.len())
+                .filter(|&other| other != node)
+                .map(|other| network.http_url(other))
+                .collect();
+            expected.sort();
+            assert_eq!(urls, expected, "peers of node {node}");
+        }
+
+        let url = network.dashboard_url();
+        for node in 0..=follower {
+            assert!(url.contains(&network.http_url(node)));
+        }
+        let page = client.get(&url).send().await.unwrap();
+        assert!(page.status().is_success());
+        assert!(page.text().await.unwrap().contains("<html"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixed_ports_are_reused_by_the_next_network() {
+        // Three consecutive free ports, released before the networks bind them.
+        let base = loop {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = probe.local_addr().unwrap().port();
+            if base > u16::MAX - 3 {
+                continue;
+            }
+            let next = (
+                TcpListener::bind(("127.0.0.1", base + 1)).await,
+                TcpListener::bind(("127.0.0.1", base + 2)).await,
+            );
+            if let (Ok(_), Ok(_)) = next {
+                break base;
+            }
+        };
+        for round in 0..2 {
+            let network = Testnet::spawn_on(3, BLOCK_TIME, Some(base)).await.unwrap();
+            assert_eq!(
+                network.http_url(2),
+                format!("http://127.0.0.1:{}", base + 2)
+            );
+            send_load(&network.http_url(round), load(10 + round as u64, 20)).await;
+            network.wait_until_synced(20, TIMEOUT).await.unwrap();
         }
     }
 

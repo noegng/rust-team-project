@@ -121,6 +121,7 @@ for _ in $(seq 120); do
 done
 ((${min:-0} >= 4)) || fail "nodes did not sync within 60s"
 
+echo "dashboard: ${URLS[0]}/?nodes=$(IFS=,; echo "${URLS[*]}")"
 echo "sending $TX_COUNT transactions to node 1..."
 NODE_URL=${URLS[0]} METRICS_URLS=$(IFS=,; echo "${URLS[*]}") TX_COUNT=$TX_COUNT \
     "$CLIENT_BIN" | tee "$OUT/client.log"

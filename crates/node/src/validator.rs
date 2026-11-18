@@ -98,7 +98,8 @@ pub(crate) fn produce_block(
     let prev_hash = last.block_data.hash.clone();
     let transactions = mempool.drain(chain);
     let block = Block::new(index, prev_hash, transactions, timestamp, signing_key)?;
-    chain.push(block.clone())?;
+    // Drained from the mempool: every TX was verified on admission.
+    chain.push_trusted(block.clone(), |tx| is_verified(mempool, tx))?;
     Ok(Some(block))
 }
 
@@ -111,11 +112,18 @@ pub(crate) fn accept_block(
     metrics: &Metrics,
     block: Block,
 ) -> Result<(), ValidatorError> {
-    chain.push(block)?;
+    chain.push_trusted(block, |tx| is_verified(mempool, tx))?;
     let block = chain.last();
     mempool.remove_included(&block.block_data.transactions)?;
     metrics.record_block(block);
     Ok(())
+}
+
+/// Mempool `seen` only holds hashes of TXs that passed `verify` or were
+/// included in an accepted block: their signature need not be checked again.
+fn is_verified(mempool: &Mempool, tx: &blockchain::transaction::Transaction) -> bool {
+    tx.calculate_hash()
+        .is_ok_and(|hash| mempool.contains(&hash))
 }
 
 fn unix_secs() -> u64 {

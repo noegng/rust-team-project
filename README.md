@@ -120,6 +120,12 @@ Les autres nodes sont trouvés via `GET /peers` (découverte mDNS). Si mDNS ne
 passe pas, fixer la liste dans l'URL :
 `http://<IP_PC_A>:3000/?nodes=http://<IP_PC_A>:3000,http://<IP_PC_B>:3000,http://<IP_PC_C>:3000`.
 
+Le dashboard suit aussi les tests et benchmarks :
+
+- `scripts/stress.sh` et `scripts/profile-nodes.sh` affichent son URL au démarrage ;
+- les nodes du `Testnet` (tests, Criterion) se déclarent les uns aux autres dans `GET /peers`, donc le `/` de n'importe lequel montre tout le réseau ;
+- `DASHBOARD_PORT=3200 cargo bench -p node --features testnet -- stress` fixe les ports (3200-3202) de chaque réseau lancé par le bench, et affiche l'URL à ouvrir une fois : le même onglet suit toutes les itérations (chaque itération repart d'une chaîne neuve). Le polling du navigateur ajoute un peu de charge aux mesures.
+
 ## Stress test (`scripts/stress.sh`)
 
 Nécessite `curl` et `jq` (et `openssl` en local). Le script affiche la
@@ -216,8 +222,11 @@ cargo bench -p node --features testnet -- --test  # vérification rapide (1 ité
 | `bad_sync/reset_on_bad_block` | Temps pour qu'un node coupe un peer qui envoie un bloc invalide |
 | `bad_sync/load_with_bad_blocks/1000` | Même charge, pendant qu'un peer malveillant envoie 5 blocs invalides au node B |
 | `catch_up/late_node/1000` | Rattrapage d'un nouveau node sur une chaîne contenant 1000 TX |
+| `stress/ramp/{tps}` | Montée en charge, blocs toutes les 10 ms : 12 expéditeurs cadencés (boucle ouverte) répartis sur les 3 nodes envoient `tps` TX/s pendant 2 s, puis 5 s pour tout committer. 3 runs par palier (hors Criterion, dont l'échantillonnage impose au moins 10 runs + chauffe ; 1 run avec `--test`). Débit offert ×1,5 à chaque palier à partir de 5 000 TX/s ; arrêt au premier palier dont le taux d'erreur (TX rejetées + perdues + non committées partout à temps) dépasse 1 % |
 
-Après Criterion, le bench affiche et écrit dans `target/criterion/network_stats.json` : temps moyen / p50 / p95 / max de sync, lag après la fin de l'envoi, taux d'erreur (TX rejetées ou perdues / TX envoyées), nombre de resets de sync (total, par bloc invalide, inattendus), propagation et finalité moyennes, TPS jusqu'à la sync.
+`cargo bench -p node --features testnet -- stress` ne lance que le stress test ; il affiche le taux d'erreur de chaque palier puis le meilleur TPS jusqu'à la sync avec au plus 1 % d'erreur.
+
+Après Criterion, le bench affiche et écrit dans `target/criterion/network_stats.json` : temps moyen / p50 / p95 / max de sync, lag après la fin de l'envoi, taux d'erreur (TX rejetées ou perdues / TX envoyées), nombre de resets de sync (total, par bloc invalide, inattendus), propagation et finalité moyennes, TPS jusqu'à la sync, plus gros bloc (limite `MAX_TXS_PER_BLOCK` = 20 000).
 
 ## Flamegraph par node (samply)
 
