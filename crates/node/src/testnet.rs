@@ -53,7 +53,19 @@ pub struct NodeStats {
 impl Testnet {
     /// Starts `size` validators (keys seeded `1..=size`), fully meshed:
     /// node `i` dials every node `j > i`, like mDNS discovery does.
+    /// Ports are picked by the OS; see [`Testnet::spawn_on`] for fixed ones.
     pub async fn spawn(size: u8, block_time: Duration) -> anyhow::Result<Self> {
+        Self::spawn_on(size, block_time, None).await
+    }
+
+    /// Like [`Testnet::spawn`]; with `Some(base)`, node `i` listens on
+    /// `127.0.0.1:base + i`, so a dashboard opened on [`Testnet::dashboard_url`]
+    /// keeps following the next network started on the same ports.
+    pub async fn spawn_on(
+        size: u8,
+        block_time: Duration,
+        base_port: Option<u16>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(size > 0, "a testnet needs at least one validator");
         anyhow::ensure!(!block_time.is_zero(), "block time must be positive");
         let keys: Vec<_> = (1..=size).map(validator_key).collect();
@@ -64,11 +76,18 @@ impl Testnet {
             tasks: JoinSet::new(),
         };
         let mut listeners = Vec::new();
-        for key in keys {
-            let (listener, node) = network.bind(key).await?;
+        for (index, key) in keys.into_iter().enumerate() {
+            let port = match base_port {
+                Some(base) => base
+                    .checked_add(index as u16)
+                    .ok_or_else(|| anyhow::anyhow!("port overflow from base {base}"))?,
+                None => 0,
+            };
+            let (listener, node) = network.bind(key, port).await?;
             network.nodes.push(node);
             listeners.push(listener);
         }
+        network.introduce_peers();
         for (index, listener) in listeners.into_iter().enumerate() {
             let peers = network.nodes[index + 1..]
                 .iter()
@@ -85,16 +104,38 @@ impl Testnet {
     /// Adds a node that only replays and relays (no block production),
     /// connected to `peer`. Returns its index.
     pub async fn spawn_follower(&mut self, peer: usize) -> anyhow::Result<usize> {
-        let (listener, node) = self.bind(validator_key(1)).await?;
+        let (listener, node) = self.bind(validator_key(1), 0).await?;
         let state = Arc::clone(&node.state);
         let peers = vec![ws_url(self.nodes[peer].address)];
         self.tasks.spawn(run_node(listener, state, peers, None));
         self.nodes.push(node);
+        self.introduce_peers();
         Ok(self.nodes.len() - 1)
     }
 
-    async fn bind(&self, key: SigningKey) -> anyhow::Result<(TcpListener, TestNode)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+    /// What mDNS does for real nodes: every node lists the others in
+    /// `GET /peers`, which the dashboard served on `/` follows.
+    fn introduce_peers(&self) {
+        for (index, node) in self.nodes.iter().enumerate() {
+            for (other, peer) in self.nodes.iter().enumerate() {
+                if other != index {
+                    node.state.record_peer(
+                        format!("node-{}", other + 1),
+                        vec![format!("http://{}", peer.address)],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Live dashboard of node 0, pinned to every node of this network.
+    pub fn dashboard_url(&self) -> String {
+        let nodes: Vec<_> = (0..self.len()).map(|node| self.http_url(node)).collect();
+        format!("{}/?nodes={}", self.http_url(0), nodes.join(","))
+    }
+
+    async fn bind(&self, key: SigningKey, port: u16) -> anyhow::Result<(TcpListener, TestNode)> {
+        let listener = bind_retrying(port).await?;
         let node = TestNode {
             address: listener.local_addr()?,
             state: Arc::new(NodeState::new(key, self.validators.clone())?),
@@ -238,6 +279,24 @@ impl Testnet {
         .await
         .map_err(|_| anyhow::anyhow!("node kept the connection after a bad block"))?;
         Ok(started.elapsed())
+    }
+}
+
+/// A fixed port may still be held for a moment by the previous network,
+/// whose tasks are aborted when it is dropped: retry for up to 2 s.
+async fn bind_retrying(port: u16) -> std::io::Result<TcpListener> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Err(error)
+                if port != 0
+                    && error.kind() == std::io::ErrorKind::AddrInUse
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -528,6 +587,78 @@ mod tests {
         assert!(report.elapsed >= Duration::from_millis(250));
         network.wait_until_synced(300, TIMEOUT).await.unwrap();
         assert_eq!(network.committed_everywhere().await, 300);
+    }
+
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(TIMEOUT)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dashboard_of_any_node_sees_the_whole_testnet() {
+        let mut network = Testnet::spawn(3, BLOCK_TIME).await.unwrap();
+        let follower = network.spawn_follower(0).await.unwrap();
+        let client = http_client();
+        for node in 0..network.len() {
+            let peers: Vec<serde_json::Value> = client
+                .get(format!("{}/peers", network.http_url(node)))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let mut urls: Vec<_> = peers
+                .iter()
+                .map(|peer| peer["urls"][0].as_str().unwrap().to_string())
+                .collect();
+            urls.sort();
+            let mut expected: Vec<_> = (0..network.len())
+                .filter(|&other| other != node)
+                .map(|other| network.http_url(other))
+                .collect();
+            expected.sort();
+            assert_eq!(urls, expected, "peers of node {node}");
+        }
+
+        let url = network.dashboard_url();
+        for node in 0..=follower {
+            assert!(url.contains(&network.http_url(node)));
+        }
+        let page = client.get(&url).send().await.unwrap();
+        assert!(page.status().is_success());
+        assert!(page.text().await.unwrap().contains("<html"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixed_ports_are_reused_by_the_next_network() {
+        // Three consecutive free ports, released before the networks bind them.
+        let base = loop {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = probe.local_addr().unwrap().port();
+            if base > u16::MAX - 3 {
+                continue;
+            }
+            let next = (
+                TcpListener::bind(("127.0.0.1", base + 1)).await,
+                TcpListener::bind(("127.0.0.1", base + 2)).await,
+            );
+            if let (Ok(_), Ok(_)) = next {
+                break base;
+            }
+        };
+        for round in 0..2 {
+            let network = Testnet::spawn_on(3, BLOCK_TIME, Some(base)).await.unwrap();
+            assert_eq!(
+                network.http_url(2),
+                format!("http://127.0.0.1:{}", base + 2)
+            );
+            send_load(&network.http_url(round), load(10 + round as u64, 20)).await;
+            network.wait_until_synced(20, TIMEOUT).await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
