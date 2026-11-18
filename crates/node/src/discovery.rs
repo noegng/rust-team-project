@@ -1,6 +1,7 @@
 use std::{collections::HashSet, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use tracing::Instrument;
 
 use crate::{NodeState, p2p};
 
@@ -90,7 +91,10 @@ pub(crate) async fn connect_peer(mut urls: Vec<String>, state: Arc<NodeState>, r
             };
 
             tracing::info!("connected to peer: {url}");
-            if p2p::run_peer(socket, Arc::clone(&state)).await == p2p::PeerExit::Ourselves {
+            let exit = p2p::run_peer(socket, Arc::clone(&state))
+                .instrument(tracing::info_span!("peer", %url))
+                .await;
+            if exit == p2p::PeerExit::Ourselves {
                 tracing::warn!("{url} leads back to this node; no longer dialing it");
                 urls.remove(index);
             } else {

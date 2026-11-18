@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use node::NodeConfig;
@@ -57,6 +57,24 @@ fn load_authorized_validators(
     Ok(validators)
 }
 
+/// Logs are also appended to `LOG_FILE` (default `logs/node-<PORT>.log`),
+/// so a run can be shared and compared between machines.
+fn open_log_file(dotenv: &HashMap<String, String>, port: u16) -> anyhow::Result<std::fs::File> {
+    let path = PathBuf::from(
+        get_env(dotenv, "LOG_FILE").unwrap_or_else(|_| format!("logs/node-{port}.log")),
+    );
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| anyhow::anyhow!("cannot open log file {}: {error}", path.display()))?;
+    println!("logging to {}", path.display());
+    Ok(file)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dotenv = read_dotenv();
@@ -65,6 +83,11 @@ async fn main() -> anyhow::Result<()> {
 
     println!("node public key: {}", hex::encode(public_key.to_bytes()));
 
+    let port: u16 = get_env(&dotenv, "PORT")
+        .unwrap_or_else(|_| "3000".into())
+        .parse()?;
+    let log_file = open_log_file(&dotenv, port)?;
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -72,14 +95,16 @@ async fn main() -> anyhow::Result<()> {
             }),
         )
         .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(Arc::new(log_file)),
+        )
         .init();
 
     let authorized_validators = load_authorized_validators(&dotenv)?;
     let block_time: u64 = get_env(&dotenv, "BLOCK_TIME_SECS")
         .unwrap_or_else(|_| "2".into())
-        .parse()?;
-    let port: u16 = get_env(&dotenv, "PORT")
-        .unwrap_or_else(|_| "3000".into())
         .parse()?;
     node::run(NodeConfig {
         signing_key,

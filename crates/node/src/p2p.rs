@@ -92,6 +92,11 @@ where
             mempool.txs.values().cloned().collect(),
         )
     };
+    tracing::info!(
+        blocks = blocks.len(),
+        pending_txs = pending.len(),
+        "replaying history to peer"
+    );
     let (mut writer, mut reader) = socket.split();
     // Until the peer's `HistoryEnd`, its chain may be ahead of ours: no block production.
     let mut replay = state.sync.begin_replay();
@@ -115,6 +120,7 @@ where
             let text = serde_json::to_string(&NodeMessage::NewTxs(txs.to_vec()))?;
             send_text(&mut writer, text).await?;
         }
+        tracing::debug!("history sent to peer");
         let ping = serde_json::to_string(&NodeMessage::Ping)?;
         let mut heartbeat = tokio::time::interval(PING_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -165,7 +171,10 @@ where
                 Ok(NodeMessage::NewTx(tx)) => submit_peer_transactions(&state, vec![tx]).await,
                 Ok(NodeMessage::NewTxs(txs)) => submit_peer_transactions(&state, txs).await,
                 Ok(NodeMessage::Ping) => {}
-                Ok(NodeMessage::HistoryEnd) => replay.finish(),
+                Ok(NodeMessage::HistoryEnd) => {
+                    tracing::info!("peer history received");
+                    replay.finish();
+                }
                 Ok(NodeMessage::NewBlock(block)) => {
                     if let Err(error) = state.accept_peer_block(*block).await {
                         state.metrics.record_sync_reset();
@@ -204,9 +213,23 @@ where
     M: PeerMessage,
     E: Display,
 {
+    // The size tells a stuck link (any size) from a path MTU black hole
+    // (small pings pass, large blocks or TX batches time out).
+    let bytes = text.len();
+    let started = std::time::Instant::now();
     tokio::time::timeout(Duration::from_secs(5), writer.send(M::text(text)))
-        .await?
-        .map_err(|error| anyhow::anyhow!("{error}"))
+        .await
+        .map_err(|_| anyhow::anyhow!("sending {bytes} bytes timed out after 5s"))?
+        .map_err(|error| anyhow::anyhow!("sending {bytes} bytes failed: {error}"))?;
+    let elapsed = started.elapsed();
+    if elapsed > Duration::from_secs(1) {
+        tracing::warn!(
+            bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow peer send"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

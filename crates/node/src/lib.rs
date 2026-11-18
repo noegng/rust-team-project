@@ -29,6 +29,7 @@ use tower_http::{
     cors::{Any, CorsLayer},
     trace::{DefaultMakeSpan, TraceLayer},
 };
+use tracing::Instrument;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -267,7 +268,9 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
         tracing::info!(%addr, "incoming peer connected");
-        p2p::handle_peer(socket, state).await;
+        p2p::handle_peer(socket, state)
+            .instrument(tracing::info_span!("peer", %addr))
+            .await;
         tracing::info!(%addr, "incoming peer disconnected");
     })
 }

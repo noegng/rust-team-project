@@ -32,6 +32,47 @@ pub(crate) struct Validator {
 /// Délai de découverte des peers au démarrage, en nombre de `block_time`.
 const SYNC_GRACE_BLOCKS: u32 = 3;
 
+/// Sans nouveau bloc pendant ce nombre de `block_time`, la rotation est loguée bloquée.
+const STALL_LOG_BLOCKS: u32 = 5;
+
+/// Suit depuis quand la chaîne attend le bloc `index`, pour loguer sans spammer.
+struct Stall {
+    index: u64,
+    since: Instant,
+    logged: Instant,
+}
+
+impl Default for Stall {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            index: 0,
+            since: now,
+            logged: now,
+        }
+    }
+}
+
+impl Stall {
+    /// Vrai si l'on attend `index` depuis plus de `after`, au plus une fois par `after`.
+    fn due(&mut self, index: u64, after: Duration) -> bool {
+        let now = Instant::now();
+        if index != self.index {
+            *self = Self {
+                index,
+                since: now,
+                logged: now,
+            };
+            return false;
+        }
+        if now.duration_since(self.logged) < after {
+            return false;
+        }
+        self.logged = now;
+        true
+    }
+}
+
 /// Un node relancé repart de la genèse : s'il produisait tout de suite, il créerait
 /// son propre bloc 1 et forkerait la chaîne des autres. Il attend donc d'abord
 /// `grace` (le temps que mDNS trouve les peers), puis qu'aucun peer connecté
@@ -60,7 +101,6 @@ impl SyncGate {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn pending_replays(&self) -> usize {
         self.pending_replays.load(Ordering::SeqCst)
     }
@@ -110,13 +150,22 @@ impl Validator {
     /// Rien n'est produit avant d'avoir reçu l'historique des peers (`SyncGate`).
     pub(crate) async fn run(self) {
         let grace = self.block_time * SYNC_GRACE_BLOCKS;
+        // Au-delà, on signale qui bloque la rotation (puis toutes les `STALL_LOG_BLOCKS`).
+        let stall_after = self.block_time * STALL_LOG_BLOCKS;
         let mut synced = false;
+        let mut stall = Stall::default();
         let mut ticker = tokio::time::interval(self.block_time);
         ticker.tick().await; // le premier tick est immédiat
         loop {
             ticker.tick().await;
             if !synced {
                 if !self.state.sync.ready(grace) {
+                    if stall.due(u64::MAX, stall_after) {
+                        tracing::warn!(
+                            pending_replays = self.state.sync.pending_replays(),
+                            "block production waiting for peers' history"
+                        );
+                    }
                     continue;
                 }
                 synced = true;
@@ -124,6 +173,18 @@ impl Validator {
             }
             if let Err(error) = self.state.produce_next_block(unix_secs()).await {
                 tracing::error!(%error, "block production failed");
+            }
+            let chain = self.state.chain.lock().await;
+            let next = chain.len();
+            if stall.due(next, stall_after) {
+                let mempool_len = self.state.mempool.lock().await.len();
+                tracing::warn!(
+                    next_index = next,
+                    proposer = %hex::encode(chain.proposer(next).to_bytes()),
+                    stalled_secs = stall.since.elapsed().as_secs(),
+                    mempool_len,
+                    "chain stalled: waiting for the proposer's block"
+                );
             }
         }
     }

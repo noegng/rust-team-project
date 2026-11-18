@@ -197,6 +197,7 @@ pub(crate) async fn submit_transactions(
                 Ok(hash) => TransactionResult::Accepted { hash },
                 Err(error) => {
                     state.metrics.record_rejected_tx();
+                    tracing::warn!(%error, "client transaction rejected");
                     TransactionResult::Rejected {
                         error: error.to_string(),
                     }
