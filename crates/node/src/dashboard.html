@@ -22,6 +22,14 @@
     --good: #0ca30c;
     --warning: #fab219;
     --critical: #d03b3b;
+    /* Mempool : place de chaque suite de TX par rapport au prochain bloc. */
+    --mp-next: #5f7f1f;
+    --mp-later: #c98500;
+    --mp-gap: #c8432f;
+    /* Étapes du traitement d'un bloc. */
+    --step-lock: #a3a29b;
+    --step-validate: #6a5acd;
+    --step-publish: #1f9bb0;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
@@ -38,6 +46,12 @@
       --series-3: #199e70;
       --series-4: #c98500;
       --series-5: #d55181;
+      --mp-next: #8aa83a;
+      --mp-later: #d69a1c;
+      --mp-gap: #e0604a;
+      --step-lock: #6f6e69;
+      --step-validate: #8f80e6;
+      --step-publish: #35b4c8;
     }
   }
   :root[data-theme="dark"] {
@@ -54,6 +68,12 @@
     --series-3: #199e70;
     --series-4: #c98500;
     --series-5: #d55181;
+    --mp-next: #8aa83a;
+    --mp-later: #d69a1c;
+    --mp-gap: #e0604a;
+    --step-lock: #6f6e69;
+    --step-validate: #8f80e6;
+    --step-publish: #35b4c8;
   }
 
   * { box-sizing: border-box; }
@@ -110,6 +130,26 @@
   td.hash { font-family: ui-monospace, monospace; font-size: 12px; }
   .table-scroll { overflow-x: auto; }
   .proposer { display: inline-flex; align-items: center; gap: 6px; }
+  .mempools { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .mempool { min-width: 0; }
+  .mempool .node-head { margin-bottom: 6px; }
+  .mempool-count { margin-left: auto; font-weight: 650; }
+  .capacity { height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; margin: 4px 0 4px; }
+  .capacity span { display: block; height: 100%; background: var(--mp-next); transition: width .4s ease; }
+  .capacity-text { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+  svg.treemap { height: 260px; border-radius: 6px; background: var(--grid); }
+  svg.treemap rect { stroke: var(--surface-1); stroke-width: 1; }
+  .mempool-note { font-size: 12px; margin-top: 6px; min-height: 1.45em; }
+  .key { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
+  .tabs button { font: inherit; font-size: 12px; font-weight: 600; border: 1px solid var(--border); background: var(--surface-0); color: var(--text-secondary); border-radius: 999px; padding: 3px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .tabs button[aria-pressed="true"] { background: var(--text-primary); color: var(--surface-1); border-color: var(--text-primary); }
+  .tabs button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+  .reading { margin: 8px 0 0; color: var(--text-secondary); max-width: 80ch; }
+  .tooltip ul { margin: 4px 0 0; padding-left: 16px; white-space: normal; width: max-content; max-width: 300px; }
+  .tooltip .split { display: grid; grid-template-columns: auto 1fr auto; gap: 1px 6px; align-items: center; }
+  td.why { white-space: normal; min-width: 220px; color: var(--text-secondary); font-size: 12px; }
   tr.fresh td { background: color-mix(in srgb, var(--series-1) 10%, transparent); }
 </style>
 </head>
@@ -131,6 +171,17 @@
   <section class="nodes" id="nodes" aria-label="Nodes"></section>
 
   <section class="panel">
+    <h2>Mempool de chaque node</h2>
+    <div class="legend">
+      <span><span class="key" style="background: var(--mp-next)"></span>Entre dans le prochain bloc</span>
+      <span><span class="key" style="background: var(--mp-later)"></span>Prochain bloc plein : attend le suivant</span>
+      <span><span class="key" style="background: var(--mp-gap)"></span>Bloquée par un nonce manquant</span>
+      <span class="muted">Un carré = une suite de nonces d'un expéditeur, aire = nombre de TX, plus foncé = attend depuis plus longtemps</span>
+    </div>
+    <div class="mempools" id="mempools"></div>
+  </section>
+
+  <section class="panel">
     <h2>TX reçues par seconde, par node (60 dernières secondes)</h2>
     <div class="legend" id="legend"></div>
     <div class="chart-wrap" id="chart-wrap">
@@ -148,10 +199,26 @@
   </section>
 
   <section class="panel">
+    <h2>Temps de traitement des blocs, par node</h2>
+    <div class="tabs" id="timing-tabs" role="group" aria-label="Node affiché"></div>
+    <div class="legend">
+      <span><span class="key" style="background: var(--step-lock)"></span>Attente du verrou</span>
+      <span><span class="key" style="background: var(--step-validate)"></span>Validation (ou construction)</span>
+      <span><span class="key" style="background: var(--step-publish)"></span>Sérialisation et envoi</span>
+      <span><span class="key" style="background: var(--critical); border-radius: 50%"></span>Lent pour sa taille (plus du double du temps habituel)</span>
+    </div>
+    <div class="chart-wrap">
+      <svg id="timing-chart" role="img" aria-label="Temps passé par le node sélectionné sur chacun des derniers blocs, par étape"></svg>
+      <div class="tooltip" id="timing-tooltip" role="status"></div>
+    </div>
+    <p class="reading" id="timing-reading"></p>
+  </section>
+
+  <section class="panel">
     <h2>Derniers blocs</h2>
     <div class="table-scroll">
       <table>
-        <thead><tr><th class="num">Bloc</th><th>Produit par</th><th class="num">TX</th><th>Hash</th><th class="num">Il y a</th></tr></thead>
+        <thead><tr><th class="num">Bloc</th><th>Produit par</th><th class="num">TX</th><th class="num">Traitement</th><th>Pourquoi</th><th>Hash</th><th class="num">Il y a</th></tr></thead>
         <tbody id="blocks"></tbody>
       </table>
     </div>
@@ -195,9 +262,10 @@ function addNode(id, candidates) {
     return;
   }
   // La couleur suit le node pour toute la session : jamais réattribuée.
-  const node = { id, candidates, url: null, slot: nodes.size % SERIES + 1, metrics: null, prev: null, error: null, el: null, behindSince: null };
+  const node = { id, candidates, url: null, slot: nodes.size % SERIES + 1, metrics: null, prev: null, error: null, el: null, behindSince: null, mempool: null, blocks: [] };
   nodes.set(id, node);
   renderNodeCard(node);
+  renderMempoolCard(node);
 }
 
 if (fixedNodes.length) {
@@ -252,14 +320,11 @@ function visibleNodes() {
   const seen = new Set();
   return [...nodes.values()].filter((node) => {
     const key = node.metrics?.public_key;
-    if (!key) return true;
-    if (seen.has(key)) {
-      node.el.hidden = true;
-      return false;
-    }
-    seen.add(key);
-    node.el.hidden = false;
-    return true;
+    const duplicate = Boolean(key) && seen.has(key);
+    if (key) seen.add(key);
+    node.el.hidden = duplicate;
+    node.mempoolEl.hidden = duplicate;
+    return !duplicate;
   });
 }
 
@@ -377,14 +442,10 @@ function updateTotals(live, latest) {
   show("total-pending", max(live.map((node) => node.metrics.mempool_len)));
 }
 
-async function refreshBlocks(live) {
+function refreshBlocks(live) {
   const source = live.find((node) => node.id === "self") || live[0];
   if (!source) return;
-  try {
-    blocks = await getJson(`${source.url}/blocks?limit=${BLOCKS_SHOWN}`);
-  } catch {
-    return;
-  }
+  blocks = source.blocks;
   const owners = new Map(live.map((node) => [node.metrics.public_key, node]));
   blockOwners = owners;
   drawBlocks();
@@ -416,6 +477,8 @@ async function refreshBlocks(live) {
     }
     who.append(span);
     cell(fmt.format(block.transactions), "num");
+    cell(block.timing ? fmtMs(totalUs(block.timing)) : "–", "num");
+    cell(blockCauses(block, source)[0] ?? "", "why");
     cell(`${block.hash.slice(0, 16)}…`, "hash");
     cell(block.index === 0 ? "–" : `${fmt.format(Math.max(0, now - block.timestamp))} s`, "num");
     return tr;
@@ -656,6 +719,431 @@ chart.addEventListener("pointermove", (event) => {
 chart.addEventListener("pointerleave", () => { hoverX = null; drawChart(); });
 window.addEventListener("resize", drawChart);
 
+
+// ---- Mempool : un treemap par node ----
+
+const STATES = [
+  { id: "next_block", color: "var(--mp-next)", text: "Entre dans le prochain bloc" },
+  { id: "later", color: "var(--mp-later)", text: "Incluable, mais le prochain bloc est plein" },
+  { id: "gap", color: "var(--mp-gap)", text: "Bloquée : un nonce manque avant elle" },
+];
+
+function renderMempoolCard(node) {
+  const card = document.createElement("article");
+  card.className = "mempool";
+  const head = document.createElement("div");
+  head.className = "node-head";
+  const swatch = document.createElement("span");
+  swatch.className = "swatch";
+  swatch.style.background = `var(--series-${node.slot})`;
+  const name = document.createElement("span");
+  name.className = "node-name";
+  const count = document.createElement("span");
+  count.className = "mempool-count";
+  head.append(swatch, name, count);
+  const capacity = document.createElement("div");
+  capacity.className = "capacity";
+  const fill = document.createElement("span");
+  fill.style.width = "0%";
+  capacity.append(fill);
+  const capacityText = document.createElement("div");
+  capacityText.className = "capacity-text";
+  const wrap = document.createElement("div");
+  wrap.className = "chart-wrap";
+  // Appelé avant la déclaration de `svgNs` (premier node) : espace de noms en dur.
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "treemap");
+  svg.setAttribute("role", "img");
+  const tip = document.createElement("div");
+  tip.className = "tooltip";
+  tip.setAttribute("role", "status");
+  wrap.append(svg, tip);
+  const note = document.createElement("div");
+  note.className = "mempool-note muted";
+  card.append(head, capacity, capacityText, wrap, note);
+  document.getElementById("mempools").append(card);
+  node.mempoolEl = card;
+  node.mp = { name, count, fill, capacityText, svg, tip, note, cells: [], hover: null };
+  svg.addEventListener("pointermove", (event) => {
+    const i = event.target.dataset?.i;
+    const box = svg.getBoundingClientRect();
+    node.mp.hover = i == null ? null : { i: Number(i), x: event.clientX - box.left, y: event.clientY - box.top };
+    showMempoolTip(node);
+  });
+  svg.addEventListener("pointerleave", () => { node.mp.hover = null; showMempoolTip(node); });
+}
+
+/** Squarified treemap : `items` ({ value }) triés du plus grand au plus petit. */
+function squarify(items, box) {
+  const out = [];
+  const total = items.reduce((sum, item) => sum + item.value, 0);
+  if (!total || box.w <= 0 || box.h <= 0) return out;
+  const scale = (box.w * box.h) / total;
+  let { x, y, w, h } = box;
+  let i = 0;
+  while (i < items.length) {
+    const short = Math.min(w, h);
+    let sum = 0, min = Infinity, max = 0, worst = Infinity, end = i;
+    while (end < items.length) {
+      const area = items[end].value * scale;
+      const s = sum + area, lo = Math.min(min, area), hi = Math.max(max, area);
+      const ratio = Math.max((short * short * hi) / (s * s), (s * s) / (short * short * lo));
+      if (ratio > worst) break;
+      sum = s; min = lo; max = hi; worst = ratio; end++;
+    }
+    const thick = sum / short;
+    let offset = 0;
+    for (let k = i; k < end; k++) {
+      const len = (items[k].value * scale) / thick;
+      out.push(w >= h
+        ? { item: items[k], x, y: y + offset, w: thick, h: len }
+        : { item: items[k], x: x + offset, y, w: len, h: thick });
+      offset += len;
+    }
+    if (w >= h) { x += thick; w -= thick; } else { y += thick; h -= thick; }
+    i = end;
+  }
+  return out;
+}
+
+function drawMempool(node) {
+  const mp = node.mp;
+  const view = node.mempool;
+  mp.name.textContent = label(node);
+  if (!view) {
+    mp.count.textContent = "";
+    mp.capacityText.textContent = node.error ? `Mempool indisponible : ${node.error}` : "";
+    mp.svg.replaceChildren();
+    mp.note.textContent = "";
+    mp.cells = [];
+    return;
+  }
+  mp.count.textContent = `${fmt.format(view.len)} TX`;
+  mp.fill.style.width = `${Math.min(100, (view.next_block / view.max_per_block) * 100)}%`;
+  const next = document.createElement("span");
+  next.textContent = `Prochain bloc : ${fmt.format(view.next_block)} / ${fmt.format(view.max_per_block)} TX`;
+  const rest = document.createElement("span");
+  rest.textContent = view.later || view.gap
+    ? [view.later && `${fmt.format(view.later)} pour les blocs suivants`, view.gap && `${fmt.format(view.gap)} bloquées`].filter(Boolean).join(", ")
+    : view.len ? "Tout part au prochain bloc" : "";
+  mp.capacityText.replaceChildren(next, rest);
+
+  const width = mp.svg.clientWidth;
+  const height = mp.svg.clientHeight;
+  mp.svg.setAttribute("aria-label", `Mempool de ${label(node)} : ${fmt.format(view.len)} TX en attente`);
+  if (!view.runs.length) {
+    mp.cells = [];
+    const empty = view.len ? "Plus que des TX déjà incluses, retirées au prochain bloc" : "Mempool vide : toutes les TX reçues sont dans un bloc";
+    mp.svg.replaceChildren(el("text", { x: width / 2, y: height / 2, "text-anchor": "middle" }, empty));
+    mp.note.textContent = "";
+    return;
+  }
+  // Une zone par état, puis les suites dans leur zone : les trous restent groupés.
+  const now = Date.now();
+  const oldest = Math.max(1, ...view.runs.map((run) => now - run.oldest_timestamp));
+  const groups = STATES.map((state) => {
+    const runs = view.runs.filter((run) => run.state === state.id).map((run) => ({ value: run.count, run }));
+    return { state, runs, value: runs.reduce((sum, item) => sum + item.value, 0) };
+  }).filter((group) => group.value > 0).sort((a, b) => b.value - a.value);
+  mp.cells = [];
+  const parts = [];
+  for (const zone of squarify(groups, { x: 0, y: 0, w: width, h: height })) {
+    const group = zone.item;
+    group.runs.sort((a, b) => b.value - a.value);
+    const inset = { x: zone.x + 1, y: zone.y + 1, w: zone.w - 2, h: zone.h - 2 };
+    for (const cell of squarify(group.runs, inset)) {
+      const run = cell.item.run;
+      // 45 % de la couleur pour la TX la plus récente, 100 % pour la plus ancienne.
+      const share = Math.round(45 + 55 * Math.min(1, (now - run.oldest_timestamp) / oldest));
+      const rect = el("rect", {
+        x: cell.x.toFixed(1), y: cell.y.toFixed(1),
+        width: Math.max(0.5, cell.w).toFixed(1), height: Math.max(0.5, cell.h).toFixed(1),
+        "data-i": mp.cells.length,
+      });
+      rect.style.fill = `color-mix(in oklab, ${group.state.color} ${share}%, var(--surface-1))`;
+      if (mp.hover?.i === mp.cells.length) rect.style.stroke = "var(--text-primary)";
+      parts.push(rect);
+      mp.cells.push({ run, state: group.state });
+    }
+  }
+  mp.svg.replaceChildren(...parts);
+  mp.note.textContent = view.hidden_runs
+    ? `${fmt.format(view.hidden_runs)} petites suites non affichées (${fmt.format(view.hidden_txs)} TX)`
+    : "";
+  showMempoolTip(node);
+}
+
+function showMempoolTip(node) {
+  const { tip, hover, cells, svg } = node.mp;
+  const cell = hover && cells[hover.i];
+  if (!cell) { tip.style.display = "none"; return; }
+  const { run, state } = cell;
+  const title = document.createElement("div");
+  const strong = document.createElement("strong");
+  strong.textContent = `${fmt.format(run.count)} TX`;
+  title.append(strong, document.createTextNode(` de ${run.sender.slice(0, 8)}…`));
+  const nonces = document.createElement("div");
+  nonces.textContent = run.count === 1 ? `Nonce ${run.first_nonce}` : `Nonces ${run.first_nonce} à ${run.first_nonce + run.count - 1}`;
+  const where = document.createElement("div");
+  where.className = "row";
+  const key = document.createElement("span");
+  key.className = "key";
+  key.style.background = state.color;
+  where.append(key, document.createTextNode(state.id === "gap" ? `Bloquée : il manque un nonce avant ${run.first_nonce}` : state.text));
+  const age = document.createElement("div");
+  age.className = "muted";
+  age.textContent = `La plus ancienne attend depuis ${fmtAxis.format(Math.max(0, Date.now() - run.oldest_timestamp) / 1000)} s`;
+  tip.replaceChildren(title, nonces, where, age);
+  tip.style.display = "block";
+  const width = svg.clientWidth;
+  const left = hover.x + 14 + tip.offsetWidth > width ? hover.x - 14 - tip.offsetWidth : hover.x + 14;
+  tip.style.left = `${Math.max(0, left)}px`;
+  tip.style.top = `${Math.max(0, Math.min(hover.y + 14, svg.clientHeight - tip.offsetHeight))}px`;
+}
+
+// ---- Temps de traitement : barres empilées par étape, causes au survol ----
+
+const timingChart = document.getElementById("timing-chart");
+const timingTooltip = document.getElementById("timing-tooltip");
+const STEPS = [
+  { key: "lock_wait_us", color: "var(--step-lock)", text: "Attente du verrou" },
+  { key: "validate_us", color: "var(--step-validate)", text: "Validation" },
+  { key: "publish_us", color: "var(--step-publish)", text: "Sérialisation et envoi" },
+];
+let timingNodeId = null;
+let hoverTiming = null;
+
+const totalUs = (timing) => timing.lock_wait_us + timing.validate_us + timing.publish_us;
+const fmtMs = (us) => `${us < 10_000 ? fmtAxis.format(us / 1000) : fmt.format(us / 1000)} ms`;
+const fmtSec = (ms) => `${fmtAxis.format(ms / 1000)} s`;
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+/** Repères du node : coût fixe d'un bloc, coût par TX et écart habituel entre blocs. */
+function baseline(node) {
+  const timed = node.blocks.filter((block) => block.timing);
+  const empty = median(timed.filter((block) => !block.transactions).map((block) => totalUs(block.timing)));
+  const overhead = empty ?? 0;
+  const perTx = median(timed.filter((block) => block.transactions)
+    .map((block) => Math.max(0, totalUs(block.timing) - overhead) / block.transactions));
+  return {
+    known: timed.length > 0,
+    /** Temps attendu pour un bloc de `txs` TX sur ce node. */
+    expected: (txs) => overhead + txs * (perTx ?? 0),
+    interval: median(timed.map((block) => block.timing.interval_ms).filter((ms) => ms != null)),
+  };
+}
+
+/** Lent pour sa taille : plus du double du temps attendu, et au moins 5 ms. */
+function isSlow(block, base) {
+  if (!block.timing || !base.known) return false;
+  const total = totalUs(block.timing);
+  return total > 5_000 && total > 2 * base.expected(block.transactions);
+}
+
+/** Explications du temps passé sur un bloc, la plus significative d'abord. */
+function blockCauses(block, node) {
+  const t = block.timing;
+  if (!t) return [];
+  const base = baseline(node);
+  const total = totalUs(t);
+  const max = node.mempool?.max_per_block ?? 20_000;
+  const heavy = (us) => us > 5_000 && us > 0.4 * total;
+  const causes = [];
+  if (t.signatures_checked > 0) {
+    causes.push(`${fmt.format(t.signatures_checked)} signatures vérifiées à l'arrivée : ces TX n'étaient pas encore parvenues par gossip`);
+  } else if (heavy(t.validate_us)) {
+    causes.push(t.source === "produced"
+      ? `${fmtMs(t.validate_us)} pour trier le mempool et construire un bloc de ${fmt.format(t.transactions)} TX`
+      : `${fmtMs(t.validate_us)} pour vérifier hashes et nonces de ${fmt.format(t.transactions)} TX`);
+  }
+  if (heavy(t.lock_wait_us)) causes.push(`${fmtMs(t.lock_wait_us)} d'attente du verrou : le node admettait des TX au même moment`);
+  if (heavy(t.publish_us)) causes.push(`${fmtMs(t.publish_us)} pour sérialiser et envoyer ${fmt.format(t.transactions)} TX aux peers`);
+  if (block.transactions >= max) causes.push(`Bloc plein (${fmt.format(max)} TX) : le reste du mempool attend le bloc suivant`);
+  if (base.interval != null && t.interval_ms != null && t.interval_ms > 1.5 * base.interval && t.interval_ms - base.interval > 1_000) {
+    causes.push(`Ajouté ${fmtSec(t.interval_ms)} après le précédent (habituellement ${fmtSec(base.interval)}) : ${t.source === "received" ? "le producteur a publié en retard, ou le bloc a mis du temps à arriver" : "ce node a produit en retard"}`);
+  }
+  return causes;
+}
+
+function drawTimingTabs(shown) {
+  if (!shown.some((node) => node.id === timingNodeId)) timingNodeId = shown[0]?.id ?? null;
+  const tabs = document.getElementById("timing-tabs");
+  const ids = shown.map((node) => `${node.id}:${label(node)}`).join("|");
+  if (tabs.dataset.ids !== ids) {
+    tabs.dataset.ids = ids;
+    tabs.replaceChildren(...shown.map((node) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.id = node.id;
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = `var(--series-${node.slot})`;
+      button.append(swatch, document.createTextNode(label(node)));
+      button.addEventListener("click", () => { timingNodeId = node.id; drawTiming(); });
+      return button;
+    }));
+  }
+  for (const button of tabs.children) button.setAttribute("aria-pressed", String(button.dataset.id === timingNodeId));
+}
+
+function drawTiming() {
+  const shown = visibleNodes();
+  drawTimingTabs(shown);
+  const node = nodes.get(timingNodeId);
+  const width = timingChart.clientWidth;
+  const height = timingChart.clientHeight;
+  const plotW = Math.max(10, width - blocksMargin.left - blocksMargin.right);
+  const plotH = height - blocksMargin.top - blocksMargin.bottom;
+  const series = node ? node.blocks.filter((block) => block.index > 0).reverse() : [];
+  const base = node ? baseline(node) : {};
+  const yMaxMs = niceMax(Math.max(0, ...series.map((block) => (block.timing ? totalUs(block.timing) / 1000 : 0))));
+  const slotW = plotW / BLOCKS_SHOWN;
+  const barW = Math.max(1, slotW - 2);
+  const offset = BLOCKS_SHOWN - series.length;
+  const bottom = blocksMargin.top + plotH;
+  const h = (us) => (us / 1000 / yMaxMs) * plotH;
+  const slotX = (i) => blocksMargin.left + (offset + i) * slotW + 1;
+
+  const parts = [];
+  for (let i = 0; i <= 4; i++) {
+    const value = (yMaxMs / 4) * i;
+    const y = bottom - (value / yMaxMs) * plotH;
+    parts.push(el("line", { x1: blocksMargin.left, x2: blocksMargin.left + plotW, y1: y, y2: y, stroke: "var(--grid)", "stroke-width": 1 }));
+    parts.push(el("text", { x: blocksMargin.left - 8, y: y + 4, "text-anchor": "end" }, `${fmtAxis.format(value)} ms`));
+  }
+  series.forEach((block, i) => {
+    const faded = hoverTiming != null && hoverTiming !== block.index ? 0.45 : 1;
+    if (!block.timing) {
+      parts.push(el("rect", { x: slotX(i), y: bottom - 2, width: barW, height: 2, fill: "var(--grid)" }));
+      return;
+    }
+    let top = bottom;
+    for (const step of STEPS) {
+      const segment = h(block.timing[step.key]);
+      if (segment <= 0) continue;
+      top -= segment;
+      // 1 px d'écart entre segments, au-dessus d'une hauteur lisible.
+      parts.push(el("rect", { x: slotX(i), y: top, width: barW, height: Math.max(0.5, segment - (segment > 3 ? 1 : 0)), fill: step.color, opacity: faded }));
+    }
+    if (isSlow(block, base)) {
+      parts.push(el("circle", { cx: slotX(i) + barW / 2, cy: Math.max(blocksMargin.top, top - 6), r: 3, fill: "var(--critical)", opacity: faded }));
+    }
+  });
+  const labelled = series.length > 2 ? [0, Math.floor(series.length / 2), series.length - 1] : series.map((_, i) => i);
+  for (const i of labelled) {
+    const anchor = i === series.length - 1 ? "end" : offset + i === 0 ? "start" : "middle";
+    parts.push(el("text", { x: slotX(i) + barW / 2, y: height - 6, "text-anchor": anchor }, `#${series[i].index}`));
+  }
+  if (!series.length) {
+    parts.push(el("text", { x: width / 2, y: height / 2, "text-anchor": "middle" }, node ? "Aucun bloc ajouté depuis le démarrage de ce node" : "Aucun node joignable"));
+  }
+  timingChart.replaceChildren(...parts);
+
+  const hovered = series.findIndex((block) => block.index === hoverTiming);
+  const block = series[hovered];
+  if (block?.timing) {
+    const t = block.timing;
+    const title = document.createElement("div");
+    const strong = document.createElement("strong");
+    strong.textContent = `Bloc #${block.index}`;
+    title.append(strong, document.createTextNode(` ${t.source === "produced" ? "produit" : "reçu"}, ${fmt.format(block.transactions)} TX, ${fmtMs(totalUs(t))}`));
+    const split = document.createElement("div");
+    split.className = "split";
+    for (const step of STEPS) {
+      const key = document.createElement("span");
+      key.className = "key";
+      key.style.background = step.color;
+      const value = document.createElement("strong");
+      value.textContent = fmtMs(t[step.key]);
+      split.append(key, document.createTextNode(step.key === "validate_us" && t.source === "produced" ? "Construction" : step.text), value);
+    }
+    const children = [title, split];
+    const causes = blockCauses(block, node);
+    if (causes.length) {
+      const list = document.createElement("ul");
+      for (const cause of causes) {
+        const item = document.createElement("li");
+        item.textContent = cause;
+        list.append(item);
+      }
+      children.push(list);
+    } else {
+      const fine = document.createElement("div");
+      fine.className = "muted";
+      fine.textContent = "Rien d'inhabituel pour ce node";
+      children.push(fine);
+    }
+    if (isSlow(block, base)) {
+      const expected = document.createElement("div");
+      expected.className = "muted";
+      expected.textContent = `${fmtMs(base.expected(block.transactions))} attendus pour cette taille`;
+      children.push(expected);
+    }
+    timingTooltip.replaceChildren(...children);
+    timingTooltip.style.display = "block";
+    const cx = slotX(hovered) + barW / 2;
+    const left = cx + 12 + timingTooltip.offsetWidth > width ? cx - 12 - timingTooltip.offsetWidth : cx + 12;
+    timingTooltip.style.left = `${Math.max(0, left)}px`;
+    timingTooltip.style.top = `${blocksMargin.top}px`;
+  } else {
+    timingTooltip.style.display = "none";
+  }
+
+  // Le bloc le plus lent, en une phrase.
+  const reading = document.getElementById("timing-reading");
+  // Le bloc le plus en retard sur son temps attendu, en une phrase.
+  const excess = (b) => totalUs(b.timing) / Math.max(1, base.expected(b.transactions));
+  const slow = series.filter((b) => isSlow(b, base));
+  const worst = slow.reduce((top, b) => (!top || excess(b) > excess(top) ? b : top), null);
+  const heaviest = series.filter((b) => b.timing).reduce((top, b) => (!top || totalUs(b.timing) > totalUs(top.timing) ? b : top), null);
+  if (worst) {
+    const cause = blockCauses(worst, node)[0];
+    reading.textContent = `${slow.length === 1 ? "1 bloc lent" : `${slow.length} blocs lents`} pour leur taille sur ${label(node)}. Le pire, #${worst.index} : ${fmtMs(totalUs(worst.timing))} pour ${fmt.format(worst.transactions)} TX, ${fmtMs(base.expected(worst.transactions))} attendus.${cause ? ` ${cause}.` : ""}`;
+  } else if (heaviest) {
+    const cause = blockCauses(heaviest, node)[0];
+    reading.textContent = `Aucun bloc lent pour sa taille sur ${label(node)}. Le plus long, #${heaviest.index} : ${fmtMs(totalUs(heaviest.timing))} pour ${fmt.format(heaviest.transactions)} TX.${cause ? ` ${cause}.` : ""}`;
+  } else {
+    reading.textContent = "";
+  }
+}
+
+timingChart.addEventListener("pointermove", (event) => {
+  const node = nodes.get(timingNodeId);
+  if (!node) return;
+  const box = timingChart.getBoundingClientRect();
+  const plotW = Math.max(10, box.width - blocksMargin.left - blocksMargin.right);
+  const slot = Math.floor((event.clientX - box.left - blocksMargin.left) / (plotW / BLOCKS_SHOWN));
+  const series = node.blocks.filter((block) => block.index > 0).reverse();
+  const i = slot - (BLOCKS_SHOWN - series.length);
+  hoverTiming = i >= 0 && i < series.length ? series[i].index : null;
+  drawTiming();
+});
+timingChart.addEventListener("pointerleave", () => { hoverTiming = null; drawTiming(); });
+window.addEventListener("resize", () => {
+  drawTiming();
+  for (const node of nodes.values()) drawMempool(node);
+});
+
+/** Mempool et derniers blocs (avec temps de traitement) de chaque node joignable. */
+async function pollDetails(node) {
+  if (!node.url || node.error) {
+    node.mempool = null;
+    node.blocks = [];
+    return;
+  }
+  const [mempool, recent] = await Promise.allSettled([
+    getJson(`${node.url}/mempool`),
+    getJson(`${node.url}/blocks?limit=${BLOCKS_SHOWN}`),
+  ]);
+  if (mempool.status === "fulfilled") node.mempool = mempool.value;
+  if (recent.status === "fulfilled") node.blocks = recent.value;
+}
+
 async function tick() {
   const now = Date.now();
   const all = [...nodes.values()];
@@ -664,12 +1152,15 @@ async function tick() {
   history.push({ t: now, rates: latest });
   while (history.length && history[0].t < now - WINDOW_MS) history.shift();
 
+  await Promise.all(all.map(pollDetails));
   const live = visibleNodes().filter((node) => node.metrics && !node.error);
   updateCards(latest);
   updateTotals(live, latest);
   updateConsensus(live);
   drawChart();
-  await refreshBlocks(live);
+  refreshBlocks(live);
+  for (const node of nodes.values()) drawMempool(node);
+  drawTiming();
 }
 
 async function loop() {

@@ -5,11 +5,13 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use blockchain::{block::Block, transaction::Transaction};
+use blockchain::{
+    block::Block, chain::MAX_TXS_PER_BLOCK, mempool::PendingState, transaction::Transaction,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::NodeState;
-use crate::metrics::MetricsSnapshot;
+use crate::metrics::{BlockTiming, MetricsSnapshot};
 
 #[derive(Serialize)]
 pub(crate) struct ApiError {
@@ -44,6 +46,9 @@ pub(crate) struct BlockSummary {
     validator: Option<String>,
     transactions: usize,
     timestamp: u64,
+    /// Coût d'ajout sur ce node ; `None` pour le genesis et les blocs plus anciens
+    /// que les derniers temps conservés (ou ajoutés avant le démarrage du node).
+    timing: Option<BlockTiming>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +68,12 @@ pub(crate) async fn get_recent_blocks(
         .limit
         .unwrap_or(RECENT_BLOCKS_DEFAULT)
         .min(RECENT_BLOCKS_MAX);
+    let mut timings: std::collections::HashMap<u64, BlockTiming> = state
+        .metrics
+        .block_timings()
+        .into_iter()
+        .map(|timing| (timing.index, timing))
+        .collect();
     let chain = state.chain.lock().await;
     Json(
         chain
@@ -76,9 +87,82 @@ pub(crate) async fn get_recent_blocks(
                 validator: block.validator.map(|key| hex::encode(key.to_bytes())),
                 transactions: block.block_data.transactions.len(),
                 timestamp: block.block_data.timestamp,
+                timing: timings.remove(&block.block_data.index),
             })
             .collect(),
     )
+}
+
+/// Suite de nonces consécutifs d'un expéditeur, telle que vue par le dashboard.
+#[derive(Serialize)]
+pub(crate) struct MempoolRun {
+    /// 8 premiers octets hex de la clé publique de l'expéditeur.
+    sender: String,
+    first_nonce: u64,
+    count: usize,
+    state: PendingState,
+    oldest_timestamp: u64,
+}
+
+/// Contenu du mempool regroupé par suite, et ce que le prochain bloc en prendra.
+#[derive(Serialize)]
+pub(crate) struct MempoolView {
+    /// TX dans le pool, y compris celles qu'un `drain` supprimera (nonce déjà utilisé).
+    len: usize,
+    max_per_block: usize,
+    next_block: usize,
+    later: usize,
+    gap: usize,
+    /// Les plus grosses suites ; les autres sont comptées dans `hidden_*`.
+    runs: Vec<MempoolRun>,
+    hidden_runs: usize,
+    hidden_txs: usize,
+}
+
+/// Assez pour un treemap lisible, sans sérialiser tout un gros mempool.
+const MEMPOOL_RUNS_MAX: usize = 400;
+
+/// Même ordre de verrous que la production de blocs : la vue correspond au prochain `drain`.
+pub(crate) async fn get_mempool(State(state): State<Arc<NodeState>>) -> Json<MempoolView> {
+    let chain = state.chain.lock().await;
+    let mempool = state.mempool.lock().await;
+    let mut runs = mempool.pending_runs(&chain);
+    let len = mempool.len();
+    drop(mempool);
+    drop(chain);
+
+    let total = |state: PendingState| {
+        runs.iter()
+            .filter(|run| run.state == state)
+            .map(|run| run.count)
+            .sum()
+    };
+    let (next_block, later, gap) = (
+        total(PendingState::NextBlock),
+        total(PendingState::Later),
+        total(PendingState::Gap),
+    );
+    runs.sort_by_key(|run| std::cmp::Reverse(run.count));
+    let hidden = runs.split_off(runs.len().min(MEMPOOL_RUNS_MAX));
+    Json(MempoolView {
+        len,
+        max_per_block: MAX_TXS_PER_BLOCK,
+        next_block,
+        later,
+        gap,
+        runs: runs
+            .into_iter()
+            .map(|run| MempoolRun {
+                sender: hex::encode(&run.from[..run.from.len().min(8)]),
+                first_nonce: run.first_nonce,
+                count: run.count,
+                state: run.state,
+                oldest_timestamp: run.oldest_timestamp,
+            })
+            .collect(),
+        hidden_runs: hidden.len(),
+        hidden_txs: hidden.iter().map(|run| run.count).sum(),
+    })
 }
 
 #[derive(Serialize)]
@@ -489,6 +573,36 @@ mod tests {
         let all: serde_json::Value = get("/blocks").await.unwrap().json().await.unwrap();
         assert_eq!(all.as_array().unwrap().len(), 3);
         assert!(all[2]["validator"].is_null());
+
+        // Temps d'ajout sur ce node, sauf pour le genesis.
+        assert_eq!(blocks[1]["timing"]["index"], 1);
+        assert_eq!(blocks[1]["timing"]["source"], "produced");
+        assert!(blocks[1]["timing"]["validate_us"].is_u64());
+        assert!(blocks[0]["timing"]["interval_ms"].is_u64());
+        assert!(all[2]["timing"].is_null());
+
+        let future = Transaction::new(&key.verifying_key(), 10, 5, 7, &key).unwrap();
+        let next = Transaction::new(&key.verifying_key(), 10, 1, 8, &key).unwrap();
+        state.submit_transaction(future).await.unwrap();
+        state.submit_transaction(next).await.unwrap();
+        let mempool: serde_json::Value = get("/mempool").await.unwrap().json().await.unwrap();
+        assert_eq!(mempool["len"], 2);
+        assert_eq!(mempool["max_per_block"], MAX_TXS_PER_BLOCK);
+        assert_eq!(mempool["next_block"], 1);
+        assert_eq!(mempool["gap"], 1);
+        assert_eq!(mempool["later"], 0);
+        assert_eq!(mempool["hidden_runs"], 0);
+        let runs = mempool["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs.iter()
+                .any(|run| run["state"] == "next_block" && run["first_nonce"] == 1)
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run["state"] == "gap" && run["oldest_timestamp"] == 7)
+        );
+        assert_eq!(runs[0]["sender"], public_key[..16]);
 
         let peers: serde_json::Value = get("/peers").await.unwrap().json().await.unwrap();
         assert_eq!(
