@@ -60,12 +60,19 @@ where
         )
     };
     let (mut writer, mut reader) = socket.split();
+    // Until the peer's `HistoryEnd`, its chain may be ahead of ours: no block production.
+    let mut replay = state.sync.begin_replay();
     // Read while sending the snapshot, including when both peers replay at once.
     let send = async {
         for block in blocks {
             let text = serde_json::to_string(&NodeMessage::NewBlock(Box::new(block)))?;
             send_text(&mut writer, text).await?;
         }
+        send_text(
+            &mut writer,
+            serde_json::to_string(&NodeMessage::HistoryEnd)?,
+        )
+        .await?;
         for txs in pending.chunks(REPLAY_BATCH) {
             let text = serde_json::to_string(&NodeMessage::NewTxs(txs.to_vec()))?;
             send_text(&mut writer, text).await?;
@@ -104,6 +111,7 @@ where
                 Ok(NodeMessage::NewTx(tx)) => submit_peer_transactions(&state, vec![tx]).await,
                 Ok(NodeMessage::NewTxs(txs)) => submit_peer_transactions(&state, txs).await,
                 Ok(NodeMessage::Ping) => {}
+                Ok(NodeMessage::HistoryEnd) => replay.finish(),
                 Ok(NodeMessage::NewBlock(block)) => {
                     if let Err(error) = state.accept_peer_block(*block).await {
                         state.metrics.record_sync_reset();
@@ -499,6 +507,14 @@ mod tests {
         })
         .await
         .expect("late node should replay the same chain");
+        // The peer marks the end of its history: the fresh node may then produce.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while late.sync.pending_replays() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late node should receive the end of the peer history");
         let chain = late.chain.lock().await;
         assert_eq!(late.metrics.snapshot(chain.len(), 0).txs_committed, 10);
         assert!(late.mempool.lock().await.is_empty());

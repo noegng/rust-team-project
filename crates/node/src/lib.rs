@@ -39,6 +39,8 @@ pub enum NodeMessage {
     /// Boxed: a block is much larger than the other variants.
     NewBlock(Box<Block>),
     Ping,
+    /// Sent once after replaying the chain to a new peer: the peer has our whole history.
+    HistoryEnd,
 }
 
 struct NodeState {
@@ -49,6 +51,8 @@ struct NodeState {
     gossip: broadcast::Sender<String>,
     /// Peers vus par mDNS : ID du node → URLs HTTP candidates (une par IPv4).
     peers: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
+    /// Block production waits for the peers' history (see `validator::SyncGate`).
+    sync: validator::SyncGate,
 }
 
 impl NodeState {
@@ -76,6 +80,7 @@ impl NodeState {
             metrics: metrics::Metrics::new(),
             gossip,
             peers: std::sync::Mutex::default(),
+            sync: validator::SyncGate::new(),
         })
     }
 
