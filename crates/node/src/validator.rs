@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::metrics::Metrics;
+use crate::metrics::{BlockSource, BlockTiming, Metrics, unix_millis};
 use crate::{NodeMessage, NodeState};
 use blockchain::{
     block::{Block, BlockError},
@@ -192,17 +192,35 @@ impl Validator {
 
 impl NodeState {
     pub(crate) async fn produce_next_block(&self, now_secs: u64) -> Result<(), ValidatorError> {
+        let started = Instant::now();
         let mut chain = self.chain.lock().await;
         let mut mempool = self.mempool.lock().await;
+        let locked = Instant::now();
         if let Some(block) = produce_block(&mut chain, &mut mempool, &self.signing_key, now_secs)? {
+            let built = Instant::now();
             self.metrics.record_block(&block);
+            let (index, transactions) =
+                (block.block_data.index, block.block_data.transactions.len());
             self.publish_block(block, "produced")?;
+            self.metrics.record_block_timing(BlockTiming {
+                index,
+                source: BlockSource::Produced,
+                added_at_ms: unix_millis(),
+                interval_ms: None,
+                lock_wait_us: micros(locked - started),
+                validate_us: micros(built - locked),
+                publish_us: micros(built.elapsed()),
+                // Drained from the mempool: every signature was checked on admission.
+                signatures_checked: 0,
+                transactions,
+            });
         }
         Ok(())
     }
 
     /// Ignore known blocks; reject conflicting history and invalid successors.
     pub(crate) async fn accept_peer_block(&self, block: Block) -> Result<(), ValidatorError> {
+        let started = Instant::now();
         let mut chain = self.chain.lock().await;
         if let Some(known) = chain.blocks().get(block.block_data.index as usize)
             && known.block_data.hash == block.block_data.hash
@@ -210,8 +228,23 @@ impl NodeState {
             return Ok(());
         }
         let mut mempool = self.mempool.lock().await;
-        accept_block(&mut chain, &mut mempool, &self.metrics, block.clone())?;
+        let locked = Instant::now();
+        let (index, transactions) = (block.block_data.index, block.block_data.transactions.len());
+        let signatures_checked =
+            accept_block(&mut chain, &mut mempool, &self.metrics, block.clone())?;
+        let validated = Instant::now();
         self.publish_block(block, "received")?;
+        self.metrics.record_block_timing(BlockTiming {
+            index,
+            source: BlockSource::Received,
+            added_at_ms: unix_millis(),
+            interval_ms: None,
+            lock_wait_us: micros(locked - started),
+            validate_us: micros(validated - locked),
+            publish_us: micros(validated.elapsed()),
+            signatures_checked,
+            transactions,
+        });
         Ok(())
     }
 
@@ -253,17 +286,27 @@ pub(crate) fn produce_block(
 /// Bloc reçu d'un peer (`Message::NewBlock`) : validateur autorisé et à son tour,
 /// signature, lien, timestamp et TX sont vérifiés par `Chain::push`.
 /// Les TX incluses sont ensuite retirées du mempool.
+/// Retourne le nombre de signatures de TX vérifiées : celles absentes du mempool.
 pub(crate) fn accept_block(
     chain: &mut Chain,
     mempool: &mut Mempool,
     metrics: &Metrics,
     block: Block,
-) -> Result<(), ValidatorError> {
-    chain.push_trusted(block, |tx| is_verified(mempool, tx))?;
+) -> Result<usize, ValidatorError> {
+    let unknown = std::cell::Cell::new(0);
+    chain.push_trusted(block, |tx| {
+        let known = is_verified(mempool, tx);
+        unknown.set(unknown.get() + usize::from(!known));
+        known
+    })?;
     let block = chain.last();
     mempool.remove_included(&block.block_data.transactions)?;
     metrics.record_block(block);
-    Ok(())
+    Ok(unknown.get())
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Mempool `seen` only holds hashes of TXs that passed `verify` or were
@@ -352,6 +395,54 @@ mod tests {
         );
         assert!(peer_mempool.is_empty());
         assert_eq!(metrics.snapshot(peer_chain.len(), 0).txs_committed, 2);
+    }
+
+    #[test]
+    fn only_transactions_missing_from_the_mempool_are_checked_on_arrival() {
+        let mut producer_chain = chain();
+        let mut producer_mempool = Mempool::new();
+        for nonce in 0..3 {
+            producer_mempool.add(tx(nonce)).unwrap();
+        }
+        let block = produce_block(&mut producer_chain, &mut producer_mempool, &key(2), 10)
+            .unwrap()
+            .unwrap();
+
+        let mut peer_mempool = Mempool::new();
+        peer_mempool.add(tx(0)).unwrap();
+        let checked =
+            accept_block(&mut chain(), &mut peer_mempool, &Metrics::new(), block).unwrap();
+        assert_eq!(checked, 2);
+    }
+
+    #[tokio::test]
+    async fn produced_and_received_blocks_record_their_timing() {
+        let validators = vec![key(1).verifying_key(), key(2).verifying_key()];
+        let producer = NodeState::new(key(2), validators.clone()).unwrap();
+        producer.submit_transaction(tx(0)).await.unwrap();
+        producer.produce_next_block(10).await.unwrap();
+        let block = producer.chain.lock().await.last().clone();
+
+        let peer = NodeState::new(key(1), validators).unwrap();
+        peer.accept_peer_block(block.clone()).await.unwrap();
+        // Déjà connu : pas de second enregistrement.
+        peer.accept_peer_block(block).await.unwrap();
+
+        let produced = producer.metrics.block_timings();
+        let received = peer.metrics.block_timings();
+        assert_eq!(produced.len(), 1);
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            (produced[0].index, produced[0].source),
+            (1, BlockSource::Produced)
+        );
+        assert_eq!(
+            (received[0].index, received[0].source),
+            (1, BlockSource::Received)
+        );
+        assert_eq!(received[0].transactions, 1);
+        assert_eq!(received[0].signatures_checked, 1);
+        assert_eq!(received[0].interval_ms, None);
     }
 
     #[test]

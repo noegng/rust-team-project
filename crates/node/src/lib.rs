@@ -202,6 +202,7 @@ fn app(state: Arc<NodeState>) -> Router {
         .route("/blocks/{index}", get(api::get_block))
         .route("/metrics", get(api::get_metrics))
         .route("/peers", get(api::get_peers))
+        .route("/mempool", get(api::get_mempool))
         .with_state(state)
         .layer(cors)
         .layer(

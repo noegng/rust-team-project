@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +9,38 @@ use serde::Serialize;
 /// Une rafale d'envoi se termine après ce délai sans nouvelle TX ; la suivante repart de zéro.
 const BURST_IDLE_MS: u64 = 1_000;
 
+/// Temps de traitement conservés : autant que `GET /blocks` peut en montrer.
+pub(crate) const BLOCK_TIMINGS_KEPT: usize = 100;
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BlockSource {
+    Produced,
+    Received,
+}
+
+/// Coût d'ajout d'un bloc sur ce node, étape par étape (microsecondes).
+/// Les trois étapes se suivent : leur somme est le temps passé sur le bloc.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub(crate) struct BlockTiming {
+    pub index: u64,
+    pub source: BlockSource,
+    /// Ajout à la chaîne locale, ms Unix.
+    pub added_at_ms: u64,
+    /// Écart avec le bloc précédent ajouté par ce node ; `None` pour le premier.
+    pub interval_ms: Option<u64>,
+    /// Attente des verrous `chain` puis `mempool` (tenus par l'admission de TX).
+    pub lock_wait_us: u64,
+    /// Produit : tri du mempool, construction, signature, ajout.
+    /// Reçu : vérification du bloc et de ses TX, ajout, nettoyage du mempool.
+    pub validate_us: u64,
+    /// Sérialisation du bloc et envoi aux peers (verrous encore tenus).
+    pub publish_us: u64,
+    /// Signatures de TX vérifiées pendant la validation : TX pas encore reçues par gossip.
+    pub signatures_checked: usize,
+    pub transactions: usize,
+}
+
 /// Compteurs du node, partagés via `Arc<Metrics>`.
 pub(crate) struct Metrics {
     throughput: Throughput,
@@ -17,6 +50,8 @@ pub(crate) struct Metrics {
     finality_ms: Average,
     txs_rejected: AtomicU64,
     sync_resets: AtomicU64,
+    /// Derniers blocs ajoutés, du plus ancien au plus récent.
+    block_timings: Mutex<VecDeque<BlockTiming>>,
 }
 
 /// Vue sérialisable des métriques (ex. réponse de `GET /metrics`).
@@ -47,7 +82,32 @@ impl Metrics {
             finality_ms: Average::default(),
             txs_rejected: AtomicU64::new(0),
             sync_resets: AtomicU64::new(0),
+            block_timings: Mutex::default(),
         }
+    }
+
+    /// `interval_ms` est calculé ici, à partir du bloc précédent enregistré.
+    pub(crate) fn record_block_timing(&self, mut timing: BlockTiming) {
+        let mut timings = self
+            .block_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        timing.interval_ms = timings
+            .back()
+            .map(|last| timing.added_at_ms.saturating_sub(last.added_at_ms));
+        if timings.len() == BLOCK_TIMINGS_KEPT {
+            timings.pop_front();
+        }
+        timings.push_back(timing);
+    }
+
+    pub(crate) fn block_timings(&self) -> Vec<BlockTiming> {
+        self.block_timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn record_rejected_tx(&self) {
@@ -168,7 +228,7 @@ fn age_ms(timestamp_ms: u64, now_ms: u64) -> u64 {
     now_ms.saturating_sub(timestamp_ms)
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
@@ -254,6 +314,33 @@ mod tests {
         assert_eq!(snapshot.txs_rejected, 2);
         assert_eq!(snapshot.sync_resets, 1);
         assert_eq!(snapshot.txs_received, 0);
+    }
+
+    #[test]
+    fn block_timings_keep_the_latest_with_intervals() {
+        let metrics = Metrics::new();
+        let timing = |index, added_at_ms| BlockTiming {
+            index,
+            source: BlockSource::Received,
+            added_at_ms,
+            interval_ms: Some(999),
+            lock_wait_us: 1,
+            validate_us: 2,
+            publish_us: 3,
+            signatures_checked: 0,
+            transactions: 0,
+        };
+        for index in 0..BLOCK_TIMINGS_KEPT as u64 + 2 {
+            metrics.record_block_timing(timing(index, 1_000 + index * 2_000));
+        }
+        let timings = metrics.block_timings();
+        assert_eq!(timings.len(), BLOCK_TIMINGS_KEPT);
+        assert_eq!(timings[0].index, 2);
+        assert_eq!(timings.last().unwrap().interval_ms, Some(2_000));
+
+        let first = Metrics::new();
+        first.record_block_timing(timing(1, 5_000));
+        assert_eq!(first.block_timings()[0].interval_ms, None);
     }
 
     #[test]

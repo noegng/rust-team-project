@@ -13,6 +13,29 @@ pub enum MempoolError {
     InvalidTransaction(#[from] TransactionError),
 }
 
+/// Place d'une suite de TX en attente par rapport au prochain bloc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingState {
+    /// Prise par le prochain `drain`.
+    NextBlock,
+    /// Incluable, mais au-delà de `MAX_TXS_PER_BLOCK` : attend un bloc suivant.
+    Later,
+    /// Un nonce manque avant elle : attend la TX qui comble le trou.
+    Gap,
+}
+
+/// TX d'un même expéditeur aux nonces consécutifs, dans le même état.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRun {
+    pub from: Vec<u8>,
+    pub first_nonce: u64,
+    pub count: usize,
+    pub state: PendingState,
+    /// Timestamp (ms Unix, posé par le client) de la plus ancienne TX de la suite.
+    pub oldest_timestamp: u64,
+}
+
 /// Pool des transactions en attente d'inclusion dans un bloc.
 #[derive(Default)]
 pub struct Mempool {
@@ -90,6 +113,69 @@ impl Mempool {
             }
         }
         ready
+    }
+
+    /// Vue du pool par suites de nonces consécutifs d'un même expéditeur,
+    /// avec la place de chaque suite par rapport au prochain `drain`.
+    /// Ne modifie pas le pool. Les TX que `drain` supprimerait (nonce déjà
+    /// utilisé) n'apparaissent pas.
+    pub fn pending_runs(&self, chain: &Chain) -> Vec<PendingRun> {
+        self.pending_runs_up_to(chain, MAX_TXS_PER_BLOCK)
+    }
+
+    /// Même parcours que `drain_up_to` : même tri, même limite.
+    fn pending_runs_up_to(&self, chain: &Chain, limit: usize) -> Vec<PendingRun> {
+        let mut pending: Vec<_> = self.txs.iter().collect();
+        pending.sort_by(|(hash_a, a), (hash_b, b)| {
+            (&a.from, a.nonce, hash_a).cmp(&(&b.from, b.nonce, hash_b))
+        });
+
+        let mut runs: Vec<PendingRun> = Vec::new();
+        let mut included = 0;
+        let mut sender: Option<&[u8]> = None;
+        // Prochain nonce contigu pour l'expéditeur courant, et s'il est encore incluable.
+        let mut next = 0;
+        let mut contiguous = true;
+        for (_, tx) in pending {
+            if sender != Some(tx.from.as_slice()) {
+                sender = Some(&tx.from);
+                next = chain.next_nonce(&tx.from);
+                contiguous = true;
+            }
+            if tx.nonce < next {
+                continue;
+            }
+            let state = if tx.nonce == next && contiguous {
+                if included < limit {
+                    included += 1;
+                    PendingState::NextBlock
+                } else {
+                    PendingState::Later
+                }
+            } else {
+                contiguous = false;
+                PendingState::Gap
+            };
+            next = tx.nonce.saturating_add(1);
+            match runs.last_mut() {
+                Some(run)
+                    if run.state == state
+                        && run.from == tx.from
+                        && run.first_nonce + run.count as u64 == tx.nonce =>
+                {
+                    run.count += 1;
+                    run.oldest_timestamp = run.oldest_timestamp.min(tx.timestamp);
+                }
+                _ => runs.push(PendingRun {
+                    from: tx.from.clone(),
+                    first_nonce: tx.nonce,
+                    count: 1,
+                    state,
+                    oldest_timestamp: tx.timestamp,
+                }),
+            }
+        }
+        runs
     }
 
     /// Retire les TX incluses dans un bloc reçu d'un autre validateur.
@@ -252,6 +338,69 @@ mod tests {
         chain.push(block).unwrap();
         assert_eq!(chain.next_nonce(&tx_from(5, 0, 0).from), 2);
         assert_eq!(chain.next_nonce(&tx_from(7, 0, 0).from), 3);
+    }
+
+    #[test]
+    fn pending_runs_match_what_drain_would_take() {
+        let mut chain = chain();
+        let first = Block::new(
+            1,
+            chain.last().block_data.hash.clone(),
+            vec![tx_from(7, 7, 0)],
+            1,
+            &validator(),
+        )
+        .unwrap();
+        chain.push(first).unwrap();
+
+        let mut mempool = Mempool::new();
+        for tx in [
+            tx_from(5, 5, 0),
+            tx_from(5, 5, 1),
+            tx_from(5, 5, 2),
+            tx_from(5, 5, 4), // trou : nonce 3 manquant
+            tx_from(5, 5, 5),
+            tx_from(7, 70, 0), // rejeu : ignoré
+            tx_from(7, 7, 1),
+            tx_from(7, 7, 2),
+        ] {
+            mempool.add(tx).unwrap();
+        }
+
+        let runs = mempool.pending_runs_up_to(&chain, 4);
+        let shape: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.from == tx_from(5, 0, 0).from,
+                    run.first_nonce,
+                    run.count,
+                    run.state,
+                )
+            })
+            .collect();
+        use PendingState::*;
+        // 4 places, prises dans l'ordre de drain (par expéditeur puis nonce).
+        let expected = if tx_from(5, 0, 0).from < tx_from(7, 0, 0).from {
+            vec![
+                (true, 0, 3, NextBlock),
+                (true, 4, 2, Gap),
+                (false, 1, 1, NextBlock),
+                (false, 2, 1, Later),
+            ]
+        } else {
+            vec![
+                (false, 1, 2, NextBlock),
+                (true, 0, 2, NextBlock),
+                (true, 2, 1, Later),
+                (true, 4, 2, Gap),
+            ]
+        };
+        assert_eq!(shape, expected);
+        assert_eq!(mempool.len(), 8, "la vue ne modifie pas le pool");
+
+        let drained = mempool.drain_up_to(&chain, 4);
+        assert_eq!(drained.len(), 4);
     }
 
     #[test]
