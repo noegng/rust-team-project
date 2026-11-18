@@ -13,4 +13,13 @@ pub(crate) enum ClientError {
 
     #[error("request to node failed: {0}")]
     Connection(#[from] reqwest::Error),
+
+    #[error("expected one transaction result from node, got {actual}")]
+    InvalidResponseCount { actual: usize },
+
+    #[error("node returned a hash that does not match the submitted transaction")]
+    InvalidTransactionHash,
+
+    #[error("could not verify confirmations: {0}")]
+    InvalidConfirmation(String),
 }
