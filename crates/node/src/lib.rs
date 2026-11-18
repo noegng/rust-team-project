@@ -19,9 +19,10 @@ use blockchain::{
     block::Block,
     chain::Chain,
     mempool::{Mempool, MempoolError},
-    transaction::{Transaction, TransactionError},
+    transaction::{Transaction, VerifiedTransaction},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 use tower_http::{
@@ -33,9 +34,13 @@ use tower_http::{
 #[serde(tag = "type", content = "payload")]
 pub enum NodeMessage {
     NewTx(Transaction),
+    /// One message per admitted batch: per-TX messages flood the gossip channel.
+    NewTxs(Vec<Transaction>),
     /// Boxed: a block is much larger than the other variants.
     NewBlock(Box<Block>),
     Ping,
+    /// Sent once after replaying the chain to a new peer: the peer has our whole history.
+    HistoryEnd,
 }
 
 struct NodeState {
@@ -46,6 +51,8 @@ struct NodeState {
     gossip: broadcast::Sender<String>,
     /// Peers vus par mDNS : ID du node → URLs HTTP candidates (une par IPv4).
     peers: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
+    /// Block production waits for the peers' history (see `validator::SyncGate`).
+    sync: validator::SyncGate,
 }
 
 impl NodeState {
@@ -73,6 +80,7 @@ impl NodeState {
             metrics: metrics::Metrics::new(),
             gossip,
             peers: std::sync::Mutex::default(),
+            sync: validator::SyncGate::new(),
         })
     }
 
@@ -90,17 +98,86 @@ impl NodeState {
             .clone()
     }
 
-    /// Shared admission path for HTTP and peers. Only new, valid TXs are relayed.
+    /// Shared admission path for HTTP and peers; results follow `txs` order.
+    /// Signatures are checked in parallel outside the mempool lock, known TXs
+    /// (peers echo our own gossip) are skipped first, and the new valid TXs are
+    /// relayed in a single message.
+    async fn submit_transactions(
+        &self,
+        txs: Vec<Transaction>,
+    ) -> Vec<Result<String, MempoolError>> {
+        let hashed = blocking(move || {
+            txs.into_par_iter()
+                .map(|tx| {
+                    let hash = tx.calculate_hash();
+                    (tx, hash)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let fresh: Vec<bool> = {
+            let mempool = self.mempool.lock().await;
+            hashed
+                .iter()
+                .map(|(_, hash)| hash.as_ref().is_ok_and(|hash| !mempool.contains(hash)))
+                .collect()
+        };
+        let checked = blocking(move || {
+            hashed
+                .into_par_iter()
+                .zip(fresh)
+                .map(|((tx, hash), fresh)| match hash {
+                    Err(error) => Err(MempoolError::from(error)),
+                    Ok(hash) if !fresh => Err(MempoolError::AlreadySeen(hash)),
+                    Ok(_) => VerifiedTransaction::new(tx).map_err(MempoolError::from),
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        let mut admitted = Vec::new();
+        let results: Vec<_> = {
+            let mut mempool = self.mempool.lock().await;
+            checked
+                .into_iter()
+                .map(|verified| {
+                    let verified = verified?;
+                    let hash = mempool.add_verified(verified.clone())?;
+                    self.metrics.record_tx(verified.transaction());
+                    admitted.push(verified.transaction().clone());
+                    Ok(hash)
+                })
+                .collect()
+        };
+        if !admitted.is_empty() {
+            tracing::debug!(admitted = admitted.len(), "transactions admitted");
+            match serde_json::to_string(&NodeMessage::NewTxs(admitted)) {
+                // No connected peers is normal; the mempool is replayed on connection.
+                Ok(message) => {
+                    let _ = self.gossip.send(message);
+                }
+                Err(error) => tracing::error!(%error, "could not encode gossip"),
+            }
+        }
+        results
+    }
+
+    #[cfg(test)]
     async fn submit_transaction(&self, tx: Transaction) -> Result<String, MempoolError> {
-        let message = serde_json::to_string(&NodeMessage::NewTx(tx.clone()))
-            .map_err(TransactionError::from)?;
-        let mut mempool = self.mempool.lock().await;
-        let hash = mempool.add(tx.clone())?;
-        self.metrics.record_tx(&tx);
-        // No connected peers is normal; the mempool is replayed on connection.
-        let _ = self.gossip.send(message);
-        tracing::debug!(%hash, mempool_len = mempool.len(), "transaction admitted");
-        Ok(hash)
+        self.submit_transactions(vec![tx])
+            .await
+            .pop()
+            .expect("one result per transaction")
+    }
+}
+
+/// Runs CPU-bound work (signature checks) off the async workers.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        // Cancelled: only while the runtime shuts down, which drops this task next.
+        Err(_) => std::future::pending().await,
     }
 }
 

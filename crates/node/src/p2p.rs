@@ -1,12 +1,15 @@
 use std::{fmt::Display, sync::Arc, time::Duration};
 
 use axum::extract::ws::Message as AxumMessage;
-use blockchain::mempool::MempoolError;
+use blockchain::{mempool::MempoolError, transaction::Transaction};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use crate::{NodeMessage, NodeState};
+
+/// Pending TXs per message when replaying the mempool to a new peer.
+const REPLAY_BATCH: usize = 1_000;
 
 /// Both inbound (Axum) and outbound (Tungstenite) sockets use the same protocol.
 pub(crate) trait PeerMessage {
@@ -57,21 +60,33 @@ where
         )
     };
     let (mut writer, mut reader) = socket.split();
+    // Until the peer's `HistoryEnd`, its chain may be ahead of ours: no block production.
+    let mut replay = state.sync.begin_replay();
     // Read while sending the snapshot, including when both peers replay at once.
     let send = async {
         for block in blocks {
             let text = serde_json::to_string(&NodeMessage::NewBlock(Box::new(block)))?;
             send_text(&mut writer, text).await?;
         }
-        for tx in pending {
-            let text = serde_json::to_string(&NodeMessage::NewTx(tx))?;
+        send_text(
+            &mut writer,
+            serde_json::to_string(&NodeMessage::HistoryEnd)?,
+        )
+        .await?;
+        for txs in pending.chunks(REPLAY_BATCH) {
+            let text = serde_json::to_string(&NodeMessage::NewTxs(txs.to_vec()))?;
             send_text(&mut writer, text).await?;
         }
         loop {
             match outbound.recv().await {
                 Ok(text) => send_text(&mut writer, text).await?,
                 Err(RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "peer gossip lagged");
+                    // Skipped messages may include a block: without it the peer
+                    // stalls the rotation. Reconnecting replays the whole history.
+                    state.metrics.record_sync_reset();
+                    break Err(anyhow::anyhow!(
+                        "peer gossip lagged by {skipped} messages; reconnect to replay history"
+                    ));
                 }
                 Err(RecvError::Closed) => break Ok::<(), anyhow::Error>(()),
             }
@@ -93,11 +108,10 @@ where
                 continue;
             };
             match serde_json::from_str::<NodeMessage>(text) {
-                Ok(NodeMessage::NewTx(tx)) => match state.submit_transaction(tx).await {
-                    Ok(_) | Err(MempoolError::AlreadySeen(_)) => {}
-                    Err(error) => tracing::warn!(%error, "invalid peer transaction"),
-                },
+                Ok(NodeMessage::NewTx(tx)) => submit_peer_transactions(&state, vec![tx]).await,
+                Ok(NodeMessage::NewTxs(txs)) => submit_peer_transactions(&state, txs).await,
                 Ok(NodeMessage::Ping) => {}
+                Ok(NodeMessage::HistoryEnd) => replay.finish(),
                 Ok(NodeMessage::NewBlock(block)) => {
                     if let Err(error) = state.accept_peer_block(*block).await {
                         state.metrics.record_sync_reset();
@@ -112,10 +126,20 @@ where
     tokio::select! {
         result = send => {
             if let Err(error) = result {
-                tracing::debug!(%error, "peer send failed; disconnecting");
+                tracing::warn!(%error, "peer send failed; disconnecting");
             }
         }
         () = receive => {}
+    }
+}
+
+/// Duplicates are normal (every peer relays); anything else is logged.
+async fn submit_peer_transactions(state: &NodeState, txs: Vec<Transaction>) {
+    for result in state.submit_transactions(txs).await {
+        match result {
+            Ok(_) | Err(MempoolError::AlreadySeen(_)) => {}
+            Err(error) => tracing::warn!(%error, "invalid peer transaction"),
+        }
     }
 }
 
@@ -154,12 +178,13 @@ mod tests {
         let mut events = state.gossip.subscribe();
         let tx = transaction(0);
         let hash = state.submit_transaction(tx.clone()).await.unwrap();
-        let NodeMessage::NewTx(received) =
+        let NodeMessage::NewTxs(received) =
             serde_json::from_str(&events.try_recv().unwrap()).unwrap()
         else {
-            panic!("expected a transaction");
+            panic!("expected a transaction batch");
         };
-        assert_eq!(received.calculate_hash().unwrap(), hash);
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].calculate_hash().unwrap(), hash);
         assert!(matches!(
             state.submit_transaction(tx.clone()).await,
             Err(MempoolError::AlreadySeen(_))
@@ -169,6 +194,41 @@ mod tests {
         assert!(state.submit_transaction(forged).await.is_err());
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
         assert_eq!(state.mempool.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_relayed_as_one_message_of_its_new_valid_transactions() {
+        let state = state(1);
+        state.submit_transaction(transaction(0)).await.unwrap();
+        let mut events = state.gossip.subscribe();
+        let mut forged = transaction(2);
+        forged.amount += 1;
+        let batch = vec![
+            transaction(0),
+            transaction(1),
+            forged,
+            transaction(1),
+            transaction(3),
+        ];
+        let results = state.submit_transactions(batch).await;
+        assert!(matches!(results[0], Err(MempoolError::AlreadySeen(_))));
+        assert!(results[1].is_ok());
+        assert!(matches!(
+            results[2],
+            Err(MempoolError::InvalidTransaction(_))
+        ));
+        assert!(matches!(results[3], Err(MempoolError::AlreadySeen(_))));
+        assert!(results[4].is_ok());
+
+        let NodeMessage::NewTxs(relayed) =
+            serde_json::from_str(&events.try_recv().unwrap()).unwrap()
+        else {
+            panic!("expected a transaction batch");
+        };
+        let nonces: Vec<_> = relayed.iter().map(|tx| tx.nonce).collect();
+        assert_eq!(nonces, [1, 3]);
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(state.mempool.lock().await.len(), 3);
     }
 
     async fn wait_for_pool(states: &[Arc<NodeState>], expected: usize) {
@@ -447,6 +507,14 @@ mod tests {
         })
         .await
         .expect("late node should replay the same chain");
+        // The peer marks the end of its history: the fresh node may then produce.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while late.sync.pending_replays() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late node should receive the end of the peer history");
         let chain = late.chain.lock().await;
         assert_eq!(late.metrics.snapshot(chain.len(), 0).txs_committed, 10);
         assert!(late.mempool.lock().await.is_empty());

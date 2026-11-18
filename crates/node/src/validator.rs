@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::Metrics;
 use crate::{NodeMessage, NodeState};
@@ -28,14 +29,99 @@ pub(crate) struct Validator {
     pub block_time: Duration,
 }
 
+/// Délai de découverte des peers au démarrage, en nombre de `block_time`.
+const SYNC_GRACE_BLOCKS: u32 = 3;
+
+/// Un node relancé repart de la genèse : s'il produisait tout de suite, il créerait
+/// son propre bloc 1 et forkerait la chaîne des autres. Il attend donc d'abord
+/// `grace` (le temps que mDNS trouve les peers), puis qu'aucun peer connecté
+/// ne soit encore en train de lui rejouer son historique. Une fois prêt, il le reste.
+pub(crate) struct SyncGate {
+    started: Instant,
+    pending_replays: AtomicUsize,
+    synced: AtomicBool,
+}
+
+impl SyncGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            pending_replays: AtomicUsize::new(0),
+            synced: AtomicBool::new(false),
+        }
+    }
+
+    /// Un peer vient de se connecter : son historique est en cours de réception.
+    pub(crate) fn begin_replay(&self) -> Replay<'_> {
+        self.pending_replays.fetch_add(1, Ordering::SeqCst);
+        Replay {
+            gate: self,
+            done: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_replays(&self) -> usize {
+        self.pending_replays.load(Ordering::SeqCst)
+    }
+
+    fn ready(&self, grace: Duration) -> bool {
+        self.ready_at(Instant::now(), grace)
+    }
+
+    fn ready_at(&self, now: Instant, grace: Duration) -> bool {
+        if self.synced.load(Ordering::SeqCst) {
+            return true;
+        }
+        let ready = now.saturating_duration_since(self.started) >= grace
+            && self.pending_replays.load(Ordering::SeqCst) == 0;
+        if ready {
+            self.synced.store(true, Ordering::SeqCst);
+        }
+        ready
+    }
+}
+
+/// Historique d'un peer en cours de réception ; terminé par `HistoryEnd`
+/// ou par la déconnexion du peer.
+pub(crate) struct Replay<'a> {
+    gate: &'a SyncGate,
+    done: bool,
+}
+
+impl Replay<'_> {
+    pub(crate) fn finish(&mut self) {
+        if !self.done {
+            self.done = true;
+            self.gate.pending_replays.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Replay<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 impl Validator {
     /// Toutes les `block_time` : si c'est notre tour, produit un bloc,
     /// l'ajoute à la chaîne locale et l'envoie aux peers.
+    /// Rien n'est produit avant d'avoir reçu l'historique des peers (`SyncGate`).
     pub(crate) async fn run(self) {
+        let grace = self.block_time * SYNC_GRACE_BLOCKS;
+        let mut synced = false;
         let mut ticker = tokio::time::interval(self.block_time);
         ticker.tick().await; // le premier tick est immédiat
         loop {
             ticker.tick().await;
+            if !synced {
+                if !self.state.sync.ready(grace) {
+                    continue;
+                }
+                synced = true;
+                tracing::info!("peers' history received; block production enabled");
+            }
             if let Err(error) = self.state.produce_next_block(unix_secs()).await {
                 tracing::error!(%error, "block production failed");
             }
@@ -98,7 +184,8 @@ pub(crate) fn produce_block(
     let prev_hash = last.block_data.hash.clone();
     let transactions = mempool.drain(chain);
     let block = Block::new(index, prev_hash, transactions, timestamp, signing_key)?;
-    chain.push(block.clone())?;
+    // Drained from the mempool: every TX was verified on admission.
+    chain.push_trusted(block.clone(), |tx| is_verified(mempool, tx))?;
     Ok(Some(block))
 }
 
@@ -111,11 +198,18 @@ pub(crate) fn accept_block(
     metrics: &Metrics,
     block: Block,
 ) -> Result<(), ValidatorError> {
-    chain.push(block)?;
+    chain.push_trusted(block, |tx| is_verified(mempool, tx))?;
     let block = chain.last();
     mempool.remove_included(&block.block_data.transactions)?;
     metrics.record_block(block);
     Ok(())
+}
+
+/// Mempool `seen` only holds hashes of TXs that passed `verify` or were
+/// included in an accepted block: their signature need not be checked again.
+fn is_verified(mempool: &Mempool, tx: &blockchain::transaction::Transaction) -> bool {
+    tx.calculate_hash()
+        .is_ok_and(|hash| mempool.contains(&hash))
 }
 
 fn unix_secs() -> u64 {
@@ -279,5 +373,30 @@ mod tests {
     fn node_requires_an_authorized_key_and_unique_validators() {
         assert!(NodeState::new(key(1), vec![key(2).verifying_key()]).is_err());
         assert!(NodeState::new(key(1), vec![key(1).verifying_key(); 2]).is_err());
+    }
+
+    #[test]
+    fn sync_gate_waits_for_grace_then_for_every_peer_history() {
+        let gate = SyncGate::new();
+        let grace = Duration::from_secs(6);
+        let start = gate.started;
+        // Seul au démarrage : on laisse le temps aux peers d'être découverts.
+        assert!(!gate.ready_at(start + Duration::from_secs(5), grace));
+
+        let mut first = gate.begin_replay();
+        let second = gate.begin_replay();
+        assert!(!gate.ready_at(start + grace, grace));
+        first.finish();
+        // Un historique complet ne suffit pas si un autre peer rejoue encore le sien.
+        assert!(!gate.ready_at(start + grace, grace));
+        // Un peer déconnecté en plein rejeu ne bloque plus la production.
+        drop(second);
+        assert!(gate.ready_at(start + grace, grace));
+
+        // Une fois synchronisé, un nouveau peer ne suspend pas la production.
+        let _late = gate.begin_replay();
+        assert!(gate.ready_at(start + grace, grace));
+        drop(first);
+        assert_eq!(gate.pending_replays.load(Ordering::SeqCst), 1);
     }
 }

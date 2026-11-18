@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::chain::{Chain, MAX_TXS_PER_BLOCK};
-use crate::transaction::{Transaction, TransactionError};
+use crate::transaction::{Transaction, TransactionError, VerifiedTransaction};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MempoolError {
@@ -35,6 +35,16 @@ impl Mempool {
         tx.verify()?;
         self.seen.insert(hash.clone());
         self.txs.insert(hash.clone(), tx);
+        Ok(hash)
+    }
+
+    /// Comme `add` pour une TX déjà vérifiée (ex. en parallèle, hors verrou).
+    pub fn add_verified(&mut self, tx: VerifiedTransaction) -> Result<String, MempoolError> {
+        let hash = tx.hash().to_string();
+        if !self.seen.insert(hash.clone()) {
+            return Err(MempoolError::AlreadySeen(hash));
+        }
+        self.txs.insert(hash.clone(), tx.transaction().clone());
         Ok(hash)
     }
 
@@ -140,6 +150,23 @@ mod tests {
         assert!(matches!(
             mempool.add(signed_tx()),
             Err(MempoolError::AlreadySeen(h)) if h == hash
+        ));
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn verified_transaction_is_added_once_and_dedups_with_add() {
+        let mut mempool = Mempool::new();
+        let verified = VerifiedTransaction::new(signed_tx()).unwrap();
+        let hash = mempool.add_verified(verified.clone()).unwrap();
+        assert!(mempool.contains(&hash));
+        assert!(matches!(
+            mempool.add_verified(verified),
+            Err(MempoolError::AlreadySeen(h)) if h == hash
+        ));
+        assert!(matches!(
+            mempool.add(signed_tx()),
+            Err(MempoolError::AlreadySeen(_))
         ));
         assert_eq!(mempool.len(), 1);
     }

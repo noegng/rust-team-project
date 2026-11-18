@@ -97,6 +97,31 @@ impl Transaction {
     }
 }
 
+/// TX dont les clés et la signature ont été vérifiées, avec son hash.
+/// Seul `new` la construit : le mempool peut l'ajouter sans revérifier,
+/// et la vérification (coûteuse) peut se faire hors de tout verrou.
+#[derive(Clone, Debug)]
+pub struct VerifiedTransaction {
+    tx: Transaction,
+    hash: String,
+}
+
+impl VerifiedTransaction {
+    pub fn new(tx: Transaction) -> Result<Self, TransactionError> {
+        tx.verify()?;
+        let hash = tx.calculate_hash()?;
+        Ok(Self { tx, hash })
+    }
+
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub fn transaction(&self) -> &Transaction {
+        &self.tx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +130,20 @@ mod tests {
         let sender = SigningKey::from_bytes(&[7; 32]);
         let recipient = SigningKey::from_bytes(&[8; 32]).verifying_key();
         Transaction::new(&recipient, 10, 3, 100, &sender).unwrap()
+    }
+
+    #[test]
+    fn only_valid_transactions_become_verified() {
+        let tx = transaction();
+        let verified = VerifiedTransaction::new(tx.clone()).unwrap();
+        assert_eq!(verified.hash(), tx.calculate_hash().unwrap());
+        assert_eq!(verified.transaction().signature, tx.signature);
+        let mut forged = tx;
+        forged.amount += 1;
+        assert!(matches!(
+            VerifiedTransaction::new(forged),
+            Err(TransactionError::InvalidSignature)
+        ));
     }
 
     #[test]
