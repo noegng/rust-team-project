@@ -189,7 +189,9 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 | `GET /transactions/{hash}` | État d'une TX (`pending` ou `included` avec numéro et hash de bloc) |
 | `GET /blocks?limit=N` | Résumé des N derniers blocs (20 par défaut, 100 max), du plus récent au plus ancien, sans les TX |
 | `GET /blocks/{index}` | Récupère un bloc par son index |
-| `GET /metrics` | `txs_received`, `tps`, `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `txs_rejected`, `sync_resets`, `height`, `last_block_hash` |
+| `GET /metrics` | `txs_received`, `tps` (débit réel du dernier envoi : TX reçues entre la première et la dernière réception ; un envoi se termine après 1 s sans TX), `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `txs_rejected` (TX refusées par `POST /transactions`), `sync_resets` (connexions peer coupées sur un bloc rejeté), `height`, `last_block_hash`, `public_key` |
+| `GET /peers` | Peers découverts par mDNS : `[{node_id, urls}]` |
+| `GET /` | Dashboard live |
 | `GET /ws` | Connexion WebSocket entre nodes |
 
 ## Tests
