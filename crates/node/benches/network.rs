@@ -28,8 +28,17 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const LOAD_SIZES: [u64; 3] = [100, 1_000, 5_000];
 const BAD_BLOCKS: u64 = 5;
 const CHAIN_TXS: u64 = 1_000;
-/// (concurrent senders, TXs per sender).
-const STRESS_LOADS: [(u64, u64); 2] = [(6, 5_000), (12, 5_000)];
+/// Stress ramp: short blocks, paced senders on every node; the offered rate
+/// grows by STRESS_GROWTH per step until a step loses more than MAX_ERROR_RATE.
+const STRESS_BLOCK_TIME: Duration = Duration::from_millis(10);
+const STRESS_SENDERS: u64 = 12;
+const STRESS_STEP: Duration = Duration::from_secs(2);
+/// A TX counts as lost if it is not committed on every node this long after the load.
+const STRESS_SETTLE: Duration = Duration::from_secs(5);
+const STRESS_START_TPS: f64 = 5_000.0;
+const STRESS_GROWTH: f64 = 1.5;
+const STRESS_MAX_STEPS: usize = 12;
+const MAX_ERROR_RATE: f64 = 0.01;
 
 /// One measured iteration.
 #[derive(Default)]
@@ -43,6 +52,8 @@ struct Run {
     propagation_ms: Vec<u64>,
     finality_ms: Vec<u64>,
     max_block_txs: u64,
+    /// Accepted TXs not committed on every node before the deadline.
+    lost: u64,
 }
 
 static RUNS: LazyLock<Mutex<BTreeMap<String, Vec<Run>>>> = LazyLock::new(Default::default);
@@ -73,34 +84,14 @@ async fn load_until_synced_from(senders: u64, per_sender: u64, rogue_blocks: u64
         .await
         .expect("testnet starts");
     let started = Instant::now();
-    let loaders: Vec<_> = (0..senders)
-        .map(|sender| {
-            let url = network.http_url(sender as usize % network.len());
-            tokio::spawn(async move {
-                let load = Load {
-                    sender: sender_key(sender),
-                    count: per_sender,
-                    batch_size: BATCH_SIZE,
-                    forged_every: None,
-                };
-                send_load(&url, load).await
-            })
-        })
-        .collect();
+    let loaders = spawn_loaders(&network, senders, per_sender, None);
     for _ in 0..rogue_blocks {
         network
             .send_bad_block(1)
             .await
             .expect("bad block is rejected");
     }
-    let mut load = LoadReport::default();
-    for loader in loaders {
-        let report = loader.await.expect("load task");
-        load.submitted += report.submitted;
-        load.accepted += report.accepted;
-        load.rejected += report.rejected;
-        load.failed += report.failed;
-    }
+    let mut load = join_loaders(loaders).await;
     let loaded = started.elapsed();
     load.elapsed = loaded;
     network
@@ -117,6 +108,43 @@ async fn load_until_synced_from(senders: u64, per_sender: u64, rogue_blocks: u64
     };
     network_totals(&network, &mut run).await;
     run
+}
+
+/// One load task per sender (own key, `per_sender` TXs, optional TX/s pace),
+/// spread round-robin over the nodes: sender 0 targets node 0.
+fn spawn_loaders(
+    network: &Testnet,
+    senders: u64,
+    per_sender: u64,
+    per_second: Option<f64>,
+) -> Vec<tokio::task::JoinHandle<LoadReport>> {
+    (0..senders)
+        .map(|sender| {
+            let url = network.http_url(sender as usize % network.len());
+            tokio::spawn(async move {
+                let load = Load {
+                    sender: sender_key(sender),
+                    count: per_sender,
+                    batch_size: BATCH_SIZE,
+                    forged_every: None,
+                    per_second,
+                };
+                send_load(&url, load).await
+            })
+        })
+        .collect()
+}
+
+async fn join_loaders(loaders: Vec<tokio::task::JoinHandle<LoadReport>>) -> LoadReport {
+    let mut load = LoadReport::default();
+    for loader in loaders {
+        let report = loader.await.expect("load task");
+        load.submitted += report.submitted;
+        load.accepted += report.accepted;
+        load.rejected += report.rejected;
+        load.failed += report.failed;
+    }
+    load
 }
 
 fn bench_sync(c: &mut Criterion, runtime: &Runtime) {
@@ -225,6 +253,7 @@ fn bench_catch_up(c: &mut Criterion, runtime: &Runtime) {
                         count: CHAIN_TXS,
                         batch_size: BATCH_SIZE,
                         forged_every: None,
+                        per_second: None,
                     };
                     let load = send_load(&network.http_url(0), load).await;
                     network
@@ -256,26 +285,72 @@ fn bench_catch_up(c: &mut Criterion, runtime: &Runtime) {
     group.finish();
 }
 
-/// Concurrent senders on every node, far above what the client demo sends:
-/// the TPS to sync shows the sustained capacity of the whole network.
+/// One ramp step: `offered_tps` for STRESS_STEP from STRESS_SENDERS paced
+/// senders, then STRESS_SETTLE for every node to commit. Never panics on
+/// overload: what is not committed everywhere by then is counted as lost.
+async fn stress_step(offered_tps: f64) -> Run {
+    let network = Testnet::spawn(VALIDATORS, STRESS_BLOCK_TIME)
+        .await
+        .expect("testnet starts");
+    let per_sender_tps = offered_tps / STRESS_SENDERS as f64;
+    let per_sender = (per_sender_tps * STRESS_STEP.as_secs_f64()).round() as u64;
+    let started = Instant::now();
+    let loaders = spawn_loaders(&network, STRESS_SENDERS, per_sender, Some(per_sender_tps));
+    let mut load = join_loaders(loaders).await;
+    let loaded = started.elapsed();
+    load.elapsed = loaded;
+    // Timing out is the overload signal, not a failure of the benchmark.
+    let _ = network
+        .wait_until_synced(load.accepted, STRESS_SETTLE)
+        .await;
+    let sync = started.elapsed();
+    let committed = network.committed_everywhere().await;
+    let mut run = Run {
+        sync,
+        lag: sync - loaded,
+        lost: load.accepted.saturating_sub(committed),
+        load,
+        ..Run::default()
+    };
+    network_totals(&network, &mut run).await;
+    run
+}
+
+fn run_error_rate(runs: &[Run]) -> f64 {
+    let submitted: u64 = runs.iter().map(|run| run.load.submitted).sum();
+    let errors: u64 = runs.iter().map(run_errors).sum();
+    if submitted == 0 {
+        0.0
+    } else {
+        errors as f64 / submitted as f64
+    }
+}
+
+fn run_errors(run: &Run) -> u64 {
+    run.load.rejected + run.load.failed + run.lost
+}
+
+/// Raises the offered TX/s step by step and stops after the first step whose
+/// error rate (rejected + failed + lost) exceeds MAX_ERROR_RATE.
 fn bench_stress(c: &mut Criterion, runtime: &Runtime) {
     let mut group = c.benchmark_group("stress");
     group
         .sampling_mode(SamplingMode::Flat)
         .sample_size(10)
         .measurement_time(Duration::from_secs(30));
-    for (senders, per_sender) in STRESS_LOADS {
-        let total = senders * per_sender;
-        let label = format!("{senders}x{per_sender}");
-        let id = format!("stress/concurrent_senders/{label}");
-        group.throughput(Throughput::Elements(total));
-        group.bench_function(BenchmarkId::new("concurrent_senders", &label), |b| {
+    let mut offered = STRESS_START_TPS;
+    for _ in 0..STRESS_MAX_STEPS {
+        let tps = offered.round() as u64;
+        let id = format!("stress/ramp/{tps:06}");
+        let per_sender = (offered / STRESS_SENDERS as f64 * STRESS_STEP.as_secs_f64()).round();
+        group.throughput(Throughput::Elements(per_sender as u64 * STRESS_SENDERS));
+        group.bench_function(BenchmarkId::new("ramp", tps), |b| {
             b.to_async(runtime).iter_custom(|iters| {
                 let id = id.clone();
                 async move {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        let run = load_until_synced_from(senders, per_sender, 0).await;
+                        let run = stress_step(offered).await;
                         total += run.sync;
                         record(&id, run);
                     }
@@ -283,6 +358,26 @@ fn bench_stress(c: &mut Criterion, runtime: &Runtime) {
                 }
             });
         });
+        let Some(error_rate) = RUNS
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|runs| run_error_rate(runs))
+        else {
+            break; // Filtered out by the command line: no ramp to follow.
+        };
+        println!(
+            "stress: offered {tps} TX/s -> error rate {:.3}%",
+            error_rate * 100.0
+        );
+        if error_rate > MAX_ERROR_RATE {
+            println!(
+                "stress: stopped, error rate above {}%",
+                MAX_ERROR_RATE * 100.0
+            );
+            break;
+        }
+        offered *= STRESS_GROWTH;
     }
     group.finish();
 }
@@ -299,6 +394,8 @@ struct Summary {
     txs_accepted: u64,
     error_rate: f64,
     failed_requests_txs: u64,
+    /// Accepted TXs not committed everywhere before the deadline (stress only).
+    lost_txs: u64,
     sync_resets: u64,
     bad_blocks: u64,
     resets_per_bad_block: Option<f64>,
@@ -326,7 +423,7 @@ fn summarize(runs: &[Run]) -> Summary {
     let sum = |f: fn(&Run) -> u64| runs.iter().map(f).sum::<u64>();
     let submitted = sum(|run| run.load.submitted);
     let accepted = sum(|run| run.load.accepted);
-    let errors = sum(|run| run.load.rejected + run.load.failed);
+    let errors = sum(run_errors);
     let sync_resets = sum(|run| run.sync_resets);
     let bad_blocks = sum(|run| run.bad_blocks);
     let all = |f: fn(&Run) -> &Vec<u64>| runs.iter().flat_map(f).copied().collect::<Vec<_>>();
@@ -346,6 +443,7 @@ fn summarize(runs: &[Run]) -> Summary {
             errors as f64 / submitted as f64
         },
         failed_requests_txs: sum(|run| run.load.failed),
+        lost_txs: sum(|run| run.lost),
         sync_resets,
         bad_blocks,
         resets_per_bad_block: (bad_blocks > 0).then(|| sync_resets as f64 / bad_blocks as f64),
@@ -373,11 +471,12 @@ fn print_report() {
             s.runs, s.avg_sync_ms, s.p50_sync_ms, s.p95_sync_ms, s.max_sync_ms, s.avg_lag_ms
         );
         println!(
-            "  txs {}/{} accepted | error rate {:.4} | failed {} | resets {} (bad blocks {}, per bad block {}, unexpected {})",
+            "  txs {}/{} accepted | error rate {:.4} | failed {} | lost {} | resets {} (bad blocks {}, per bad block {}, unexpected {})",
             s.txs_accepted,
             s.txs_submitted,
             s.error_rate,
             s.failed_requests_txs,
+            s.lost_txs,
             s.sync_resets,
             s.bad_blocks,
             opt(s.resets_per_bad_block),
@@ -389,6 +488,19 @@ fn print_report() {
             opt(s.avg_finality_ms),
             opt(s.tps_to_sync),
             s.max_block_txs
+        );
+    }
+    let sustained = summaries
+        .iter()
+        .filter(|(id, s)| id.starts_with("stress/ramp/") && s.error_rate <= MAX_ERROR_RATE)
+        .filter_map(|(_, s)| s.tps_to_sync)
+        .fold(None, |best: Option<f64>, tps| {
+            Some(best.map_or(tps, |b| b.max(tps)))
+        });
+    if let Some(tps) = sustained {
+        println!(
+            "stress: best TPS to sync with error rate <= {}%: {tps:.0} (block time {STRESS_BLOCK_TIME:?})",
+            MAX_ERROR_RATE * 100.0
         );
     }
     let target = std::env::var_os("CARGO_TARGET_DIR")

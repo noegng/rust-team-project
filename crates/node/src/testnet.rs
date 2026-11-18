@@ -189,6 +189,15 @@ impl Testnet {
         }
     }
 
+    /// TXs committed on every node (the smallest local count).
+    pub async fn committed_everywhere(&self) -> u64 {
+        let mut committed = u64::MAX;
+        for node in 0..self.len() {
+            committed = committed.min(self.stats(node).await.committed_txs);
+        }
+        committed
+    }
+
     /// Waits until `node` has at least `chain_len` blocks.
     pub async fn wait_for_height(
         &self,
@@ -299,11 +308,16 @@ pub fn sender_key(id: u64) -> SigningKey {
 /// What the load generator sends: `count` valid TXs with nonces `0..count`,
 /// in requests of `batch_size`. With `forged_every = Some(k)`, every k-th TX
 /// is followed by a tampered copy that the node must reject.
+///
+/// `per_second: None` waits for each response before the next request (closed
+/// loop). `Some(rate)` sends batches on a fixed schedule without waiting
+/// (open loop): an overloaded node then shows up as errors, not as a slower client.
 pub struct Load {
     pub sender: SigningKey,
     pub count: u64,
     pub batch_size: u64,
     pub forged_every: Option<u64>,
+    pub per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -337,6 +351,8 @@ pub async fn send_load(url: &str, load: Load) -> LoadReport {
         .expect("static reqwest configuration");
     let recipient = validator_key(200).verifying_key();
     let batch_size = load.batch_size.max(1);
+    let mut requests = JoinSet::new();
+    let mut nonce_sent = 0;
     let mut nonce = 0;
     while nonce < load.count {
         let end = (nonce + batch_size).min(load.count);
@@ -359,31 +375,64 @@ pub async fn send_load(url: &str, load: Load) -> LoadReport {
         }
         nonce = end;
         report.submitted += batch.len() as u64;
-        let response = client
-            .post(format!("{url}/transactions"))
-            .json(&batch)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status);
-        let results = match response {
-            Ok(response) => response.json::<Vec<serde_json::Value>>().await.ok(),
-            Err(_) => None,
-        };
-        match results {
-            Some(results) if results.len() == batch.len() => {
-                for result in results {
-                    if result["status"] == "accepted" {
-                        report.accepted += 1;
-                    } else {
-                        report.rejected += 1;
-                    }
-                }
+        match load.per_second {
+            None => report.add(post_batch(&client, url, batch).await),
+            Some(rate) => {
+                let due = started + Duration::from_secs_f64(nonce_sent as f64 / rate);
+                tokio::time::sleep_until(due.into()).await;
+                let (client, url) = (client.clone(), url.to_string());
+                requests.spawn(async move { post_batch(&client, &url, batch).await });
             }
-            _ => report.failed += batch.len() as u64,
         }
+        nonce_sent = end;
+    }
+    while let Some(outcome) = requests.join_next().await {
+        report.add(outcome.expect("request task"));
     }
     report.elapsed = started.elapsed();
     report
+}
+
+impl LoadReport {
+    fn add(&mut self, outcome: BatchOutcome) {
+        self.accepted += outcome.accepted;
+        self.rejected += outcome.rejected;
+        self.failed += outcome.failed;
+    }
+}
+
+#[derive(Default)]
+struct BatchOutcome {
+    accepted: u64,
+    rejected: u64,
+    failed: u64,
+}
+
+async fn post_batch(client: &reqwest::Client, url: &str, batch: Vec<Transaction>) -> BatchOutcome {
+    let response = client
+        .post(format!("{url}/transactions"))
+        .json(&batch)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status);
+    let results = match response {
+        Ok(response) => response.json::<Vec<serde_json::Value>>().await.ok(),
+        Err(_) => None,
+    };
+    let mut outcome = BatchOutcome::default();
+    match results {
+        Some(results) if results.len() == batch.len() => {
+            for result in results {
+                if result["status"] == "accepted" {
+                    outcome.accepted += 1;
+                } else {
+                    outcome.rejected += 1;
+                }
+            }
+        }
+        _ => outcome.failed = batch.len() as u64,
+    }
+    outcome
 }
 
 fn unix_millis() -> u64 {
@@ -405,6 +454,7 @@ mod tests {
             count,
             batch_size: 50,
             forged_every: None,
+            per_second: None,
         }
     }
 
@@ -459,6 +509,25 @@ mod tests {
             assert!(stats.avg_propagation_ms.is_some());
             assert!(stats.avg_finality_ms.is_some());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paced_load_keeps_its_schedule_and_syncs() {
+        let network = Testnet::spawn(3, BLOCK_TIME).await.unwrap();
+        // 300 TX at 1000 TX/s in batches of 50: the last batch leaves at 250 ms.
+        let report = send_load(
+            &network.http_url(0),
+            Load {
+                per_second: Some(1_000.0),
+                ..load(5, 300)
+            },
+        )
+        .await;
+        assert_eq!(report.accepted, 300);
+        assert_eq!(report.error_rate(), 0.0);
+        assert!(report.elapsed >= Duration::from_millis(250));
+        network.wait_until_synced(300, TIMEOUT).await.unwrap();
+        assert_eq!(network.committed_everywhere().await, 300);
     }
 
     #[tokio::test(flavor = "multi_thread")]
