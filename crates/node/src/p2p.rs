@@ -11,6 +11,21 @@ use crate::{NodeMessage, NodeState};
 /// Pending TXs per message when replaying the mempool to a new peer.
 const REPLAY_BATCH: usize = 1_000;
 
+/// A connection can die silently (NAT or VPN path change): the side with nothing
+/// to send would then wait forever and never reconnect. Each side pings when idle
+/// and drops a peer that stays silent for `IDLE_TIMEOUT`. The margin covers the
+/// time spent validating a large block, during which this task sends nothing.
+const PING_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(2)
+};
+const IDLE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(15)
+};
+
 /// Both inbound (Axum) and outbound (Tungstenite) sockets use the same protocol.
 pub(crate) trait PeerMessage {
     fn text(value: String) -> Self;
@@ -77,26 +92,40 @@ where
             let text = serde_json::to_string(&NodeMessage::NewTxs(txs.to_vec()))?;
             send_text(&mut writer, text).await?;
         }
+        let ping = serde_json::to_string(&NodeMessage::Ping)?;
+        let mut heartbeat = tokio::time::interval(PING_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match outbound.recv().await {
-                Ok(text) => send_text(&mut writer, text).await?,
-                Err(RecvError::Lagged(skipped)) => {
-                    // Skipped messages may include a block: without it the peer
-                    // stalls the rotation. Reconnecting replays the whole history.
-                    state.metrics.record_sync_reset();
-                    break Err(anyhow::anyhow!(
-                        "peer gossip lagged by {skipped} messages; reconnect to replay history"
-                    ));
-                }
-                Err(RecvError::Closed) => break Ok::<(), anyhow::Error>(()),
+            tokio::select! {
+                message = outbound.recv() => match message {
+                    Ok(text) => send_text(&mut writer, text).await?,
+                    Err(RecvError::Lagged(skipped)) => {
+                        // Skipped messages may include a block: without it the peer
+                        // stalls the rotation. Reconnecting replays the whole history.
+                        state.metrics.record_sync_reset();
+                        break Err(anyhow::anyhow!(
+                            "peer gossip lagged by {skipped} messages; reconnect to replay history"
+                        ));
+                    }
+                    Err(RecvError::Closed) => break Ok::<(), anyhow::Error>(()),
+                },
+                _ = heartbeat.tick() => send_text(&mut writer, ping.clone()).await?,
             }
         }
     };
     let receive = async {
-        while let Some(message) = reader.next().await {
-            let message = match message {
-                Ok(message) => message,
-                Err(error) => {
+        loop {
+            let message = match tokio::time::timeout(IDLE_TIMEOUT, reader.next()).await {
+                Err(_) => {
+                    tracing::warn!(
+                        "peer silent for {}s; disconnecting",
+                        IDLE_TIMEOUT.as_secs_f32()
+                    );
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(error))) => {
                     tracing::debug!(%error, "peer read failed");
                     break;
                 }
@@ -518,5 +547,37 @@ mod tests {
         let chain = late.chain.lock().await;
         assert_eq!(late.metrics.snapshot(chain.len(), 0).txs_committed, 10);
         assert!(late.mempool.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_node_pings_and_drops_a_silent_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = crate::app(state(1));
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        // A peer that never sends anything, like one behind a dead connection.
+        let (mut silent, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
+            .await
+            .unwrap();
+        let mut pings = 0;
+        tokio::time::timeout(IDLE_TIMEOUT * 4, async {
+            while let Some(Ok(message)) = silent.next().await {
+                if let Some(text) = message.as_text()
+                    && matches!(serde_json::from_str(text), Ok(NodeMessage::Ping))
+                {
+                    pings += 1;
+                }
+            }
+        })
+        .await
+        .expect("the node should drop a peer that stays silent");
+        assert!(pings >= 2, "an idle node keeps pinging, got {pings}");
     }
 }
