@@ -140,7 +140,7 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 | `POST /transactions` | Soumet un lot `[Transaction]` et diffuse les TX valides aux peers |
 | `GET /transactions/{hash}` | État d'une TX (`pending` ou `included` avec numéro et hash de bloc) |
 | `GET /blocks/{index}` | Récupère un bloc par son index |
-| `GET /metrics` | `txs_received`, `tps`, `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `height`, `last_block_hash` |
+| `GET /metrics` | `txs_received`, `tps` (débit réel du dernier envoi : TX reçues entre la première et la dernière réception ; un envoi se termine après 1 s sans TX), `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `height`, `last_block_hash` |
 | `GET /ws` | Connexion WebSocket entre nodes |
 
 ## Tests

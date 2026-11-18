@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(initial["chain_len"], 1);
         assert_eq!(initial["height"], 0);
         assert_eq!(initial["last_block_hash"], genesis_hash);
-        assert_eq!(initial["tps"], 0.0);
+        assert!(initial["tps"].is_null());
         assert!(initial["avg_propagation_ms"].is_null());
         assert!(initial["avg_finality_ms"].is_null());
 
@@ -339,7 +339,8 @@ mod tests {
         assert_eq!(pending["txs_received"], 1);
         assert_eq!(pending["txs_committed"], 0);
         assert_eq!(pending["mempool_len"], 1);
-        assert!(pending["tps"].as_f64().unwrap() > 0.0);
+        // Une seule TX : pas de durée, donc pas de débit mesurable.
+        assert!(pending["tps"].is_null());
         assert!(pending["avg_propagation_ms"].is_u64());
 
         state.produce_next_block(2).await.unwrap();
