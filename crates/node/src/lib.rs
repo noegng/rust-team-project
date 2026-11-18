@@ -234,14 +234,11 @@ pub async fn run(config: NodeConfig) -> anyhow::Result<()> {
         tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, config.port)).await?;
     let port = listener.local_addr()?.port();
     tracing::debug!("listening on port {port}");
-    let node_id = format!(
-        "{:x}-{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        std::process::id(),
-    );
+    // Stable across restarts: peers keep dialing a restarted node through their
+    // existing loop instead of adding one per new ID (each extra loop opened one
+    // more connection, multiplying every gossip upload). 32 hex chars of the
+    // public key fit the 63-byte mDNS instance label.
+    let node_id = hex::encode(&state.signing_key.verifying_key().to_bytes()[..16]);
     let discovery_state = Arc::clone(&state);
     tokio::spawn(async move {
         if let Err(error) = discovery::discover_peers(node_id, port, discovery_state).await {

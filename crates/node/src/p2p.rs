@@ -9,7 +9,14 @@ use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use crate::{NodeMessage, NodeState};
 
 /// Pending TXs per message when replaying the mempool to a new peer.
-const REPLAY_BATCH: usize = 1_000;
+/// About 210 bytes of JSON per TX: 100 TX ≈ 21 KB, which a slow mobile uplink
+/// still sends within `SEND_TIMEOUT` (1000 TX ≈ 210 KB did not).
+const REPLAY_BATCH: usize = 100;
+
+/// A send slower than this drops the connection. Dead links are already caught
+/// by `IDLE_TIMEOUT`; a short value here only made slow uplinks reconnect and
+/// replay the whole history again, adding even more upload.
+const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A connection can die silently (NAT or VPN path change): the side with nothing
 /// to send would then wait forever and never reconnect. Each side pings when idle
@@ -217,9 +224,14 @@ where
     // (small pings pass, large blocks or TX batches time out).
     let bytes = text.len();
     let started = std::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(5), writer.send(M::text(text)))
+    tokio::time::timeout(SEND_TIMEOUT, writer.send(M::text(text)))
         .await
-        .map_err(|_| anyhow::anyhow!("sending {bytes} bytes timed out after 5s"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "sending {bytes} bytes timed out after {}s",
+                SEND_TIMEOUT.as_secs()
+            )
+        })?
         .map_err(|error| anyhow::anyhow!("sending {bytes} bytes failed: {error}"))?;
     let elapsed = started.elapsed();
     if elapsed > Duration::from_secs(1) {
