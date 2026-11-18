@@ -214,6 +214,35 @@ mod tests {
     }
 
     #[test]
+    fn tps_is_the_real_rate_of_the_last_burst() {
+        let metrics = Metrics::new();
+        // Envoi court sur un node démarré depuis longtemps : seule la rafale compte.
+        for at in [100_000, 100_100, 100_200, 100_300, 100_400] {
+            metrics.record_tx_at(&tx(at), at);
+        }
+        assert_eq!(metrics.snapshot(1, 0).tps, Some(10.0));
+
+        // Après plus de BURST_IDLE_MS de silence, un nouvel envoi remplace la mesure.
+        for at in [200_000, 200_010, 200_020] {
+            metrics.record_tx_at(&tx(at), at);
+        }
+        let snapshot = metrics.snapshot(1, 0);
+        assert_eq!(snapshot.tps, Some(100.0));
+        assert_eq!(snapshot.txs_received, 8);
+    }
+
+    #[test]
+    fn tps_is_unknown_without_a_measurable_duration() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.snapshot(1, 0).tps, None);
+        // Un lot reçu dans la même milliseconde n'a pas de durée mesurable.
+        for _ in 0..100 {
+            metrics.record_tx_at(&tx(5_000), 5_000);
+        }
+        assert_eq!(metrics.snapshot(1, 0).tps, None);
+    }
+
+    #[test]
     fn counts_rejected_transactions_and_sync_resets() {
         let metrics = Metrics::new();
         assert_eq!(metrics.snapshot(1, 0).txs_rejected, 0);
