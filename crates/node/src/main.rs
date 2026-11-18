@@ -4,12 +4,18 @@ mod metrics;
 mod p2p;
 mod validator;
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Router,
     extract::{ConnectInfo, State, WebSocketUpgrade},
-    response::IntoResponse,
+    http::Method,
+    response::{Html, IntoResponse},
     routing::{any, get, post},
 };
 use blockchain::{
@@ -21,7 +27,10 @@ use blockchain::{
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::{DefaultMakeSpan, TraceLayer},
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Serialize, Deserialize)]
@@ -92,6 +101,8 @@ struct NodeState {
     signing_key: SigningKey,
     metrics: metrics::Metrics,
     gossip: broadcast::Sender<String>,
+    /// Peers vus par mDNS : ID du node → URLs HTTP candidates (une par IPv4).
+    peers: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
 }
 
 impl NodeState {
@@ -118,7 +129,22 @@ impl NodeState {
             signing_key,
             metrics: metrics::Metrics::new(),
             gossip,
+            peers: std::sync::Mutex::default(),
         })
+    }
+
+    fn record_peer(&self, node_id: String, urls: Vec<String>) {
+        self.peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(node_id, urls);
+    }
+
+    fn peers(&self) -> BTreeMap<String, Vec<String>> {
+        self.peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Shared admission path for HTTP and peers. Only new, valid TXs are relayed.
@@ -135,14 +161,25 @@ impl NodeState {
     }
 }
 
+/// Dashboard live : interroge ce node et ses peers depuis le navigateur.
+const DASHBOARD: &str = include_str!("dashboard.html");
+
 fn app(state: Arc<NodeState>) -> Router {
+    // Lecture seule : le dashboard servi par un node interroge les autres nodes.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET]);
     Router::new()
+        .route("/", get(|| async { Html(DASHBOARD) }))
         .route("/ws", any(ws_handler))
         .route("/transactions", post(api::submit_transactions))
         .route("/transactions/{hash}", get(api::get_transaction))
+        .route("/blocks", get(api::get_recent_blocks))
         .route("/blocks/{index}", get(api::get_block))
         .route("/metrics", get(api::get_metrics))
+        .route("/peers", get(api::get_peers))
         .with_state(state)
+        .layer(cors)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(true)),

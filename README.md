@@ -105,7 +105,55 @@ Les nodes écoutent sur `0.0.0.0` et se découvrent automatiquement via mDNS sur
    cargo run --release -p client
    ```
 
+5. **Suivre en direct** : ouvrir `http://<IP_PC_A>:3000/` dans un navigateur (voir [Dashboard](#dashboard)).
+
 > **Astuce jour J** : si le Wi-Fi d'une salle ou d'une école bloque la découverte mDNS entre appareils ("client isolation"), connectez les 3 PC sur un partage de connexion téléphone.
+
+## Dashboard
+
+Chaque node sert un dashboard live sur `/` (par exemple `http://127.0.0.1:3000/`) :
+débit de TX reçues par node sur les 60 dernières secondes, mempool, hauteur,
+propagation et finalité de chaque node, derniers blocs avec leur producteur, et
+un état du consensus (synchronisés, node en retard ou bloqué, aucun nouveau bloc, divergence).
+
+Les autres nodes sont trouvés via `GET /peers` (découverte mDNS). Si mDNS ne
+passe pas, fixer la liste dans l'URL :
+`http://<IP_PC_A>:3000/?nodes=http://<IP_PC_A>:3000,http://<IP_PC_B>:3000,http://<IP_PC_C>:3000`.
+
+## Stress test (`scripts/stress.sh`)
+
+Nécessite `curl` et `jq` (et `openssl` en local). Le script affiche la
+progression des clients et les métriques de chaque node toutes les 2 s, puis
+attend que tous les nodes aient le même dernier bloc, les mêmes TX incluses et
+un mempool vide (code de sortie 1 sinon).
+
+**Sur une machine** (3 nodes lancés par le script sur les ports 8001 à 8003, 2 clients) :
+
+```bash
+scripts/stress.sh
+```
+
+**Sur plusieurs machines** : lancer un node sur chaque PC (voir plus haut), puis
+depuis un seul PC pilote, avec un client par node :
+
+```bash
+NODES=http://<IP_PC_A>:3000,http://<IP_PC_B>:3000,http://<IP_PC_C>:3000 scripts/stress.sh
+```
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `NODES` | vide (mode local) | URLs des nodes déjà lancés |
+| `CLIENTS` | nombre de nodes (2 en local) | Clients en parallèle, répartis sur les nodes |
+| `TX_COUNT` | `50000` | TX **par client** |
+| `CONCURRENCY` / `BATCH_SIZE` | `50` / `100` | Transmis à chaque client |
+| `CONFIRM_TIMEOUT_SECS` | `120` | Délai de confirmation de chaque client |
+| `SETTLE_TIMEOUT_SECS` | `60` | Délai d'attente de la convergence finale |
+| `LOG_DIR` | `target/stress` | Logs des nodes locaux |
+
+> **Limite connue** : un bloc de plus d'environ 30 000 TX dépasse 16 Mo de JSON,
+> la taille de trame maximale des WebSockets entre nodes. Les autres nodes ne
+> peuvent pas le recevoir et la chaîne s'arrête. Garder `CLIENTS × TX_COUNT`
+> sous ce seuil par intervalle de bloc tant que la taille des blocs n'est pas plafonnée.
 
 ## Configuration (`.env` optionnel)
 
@@ -139,8 +187,11 @@ Un modèle est disponible dans `.env.example`. Les variables déjà définies da
 |---|---|
 | `POST /transactions` | Soumet un lot `[Transaction]` et diffuse les TX valides aux peers |
 | `GET /transactions/{hash}` | État d'une TX (`pending` ou `included` avec numéro et hash de bloc) |
+| `GET /blocks?limit=N` | Résumé des N derniers blocs (20 par défaut, 100 max), du plus récent au plus ancien, sans les TX |
 | `GET /blocks/{index}` | Récupère un bloc par son index |
-| `GET /metrics` | `txs_received`, `tps` (débit réel du dernier envoi : TX reçues entre la première et la dernière réception ; un envoi se termine après 1 s sans TX), `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `height`, `last_block_hash` |
+| `GET /metrics` | `txs_received`, `tps` (débit réel du dernier envoi : TX reçues entre la première et la dernière réception ; un envoi se termine après 1 s sans TX), `avg_propagation_ms`, `txs_committed`, `avg_finality_ms`, `chain_len`, `mempool_len`, `height`, `last_block_hash`, `public_key` |
+| `GET /peers` | Peers découverts par mDNS : `[{node_id, urls}]` |
+| `GET /` | Dashboard live |
 | `GET /ws` | Connexion WebSocket entre nodes |
 
 ## Tests
