@@ -2,6 +2,7 @@
 //! and a 4th task sending many TXs to node 0 over HTTP.
 //!
 //! Run: `cargo bench -p node --features testnet`
+//! Stress only: `cargo bench -p node --features testnet -- stress`
 //! Quick check: `cargo bench -p node --features testnet -- --test`
 //!
 //! Criterion measures the wall time; the network statistics it cannot express
@@ -27,6 +28,8 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const LOAD_SIZES: [u64; 3] = [100, 1_000, 5_000];
 const BAD_BLOCKS: u64 = 5;
 const CHAIN_TXS: u64 = 1_000;
+/// (concurrent senders, TXs per sender).
+const STRESS_LOADS: [(u64, u64); 2] = [(6, 5_000), (12, 5_000)];
 
 /// One measured iteration.
 #[derive(Default)]
@@ -39,6 +42,7 @@ struct Run {
     sync_resets: u64,
     propagation_ms: Vec<u64>,
     finality_ms: Vec<u64>,
+    max_block_txs: u64,
 }
 
 static RUNS: LazyLock<Mutex<BTreeMap<String, Vec<Run>>>> = LazyLock::new(Default::default);
@@ -53,33 +57,52 @@ async fn network_totals(network: &Testnet, run: &mut Run) {
         run.sync_resets += stats.sync_resets;
         run.propagation_ms.extend(stats.avg_propagation_ms);
         run.finality_ms.extend(stats.avg_finality_ms);
+        run.max_block_txs = run.max_block_txs.max(stats.max_block_txs);
     }
 }
 
 /// Load from a 4th task until the 3 nodes agree on every accepted TX.
 async fn load_until_synced(count: u64, rogue_blocks: u64) -> Run {
+    load_until_synced_from(1, count, rogue_blocks).await
+}
+
+/// `senders` concurrent load tasks (one key each, `per_sender` TXs), spread
+/// round-robin over the nodes: sender 0 targets node 0.
+async fn load_until_synced_from(senders: u64, per_sender: u64, rogue_blocks: u64) -> Run {
     let network = Testnet::spawn(VALIDATORS, BLOCK_TIME)
         .await
         .expect("testnet starts");
-    let url = network.http_url(0);
     let started = Instant::now();
-    let loader = tokio::spawn(async move {
-        let load = Load {
-            sender: sender_key(count),
-            count,
-            batch_size: BATCH_SIZE,
-            forged_every: None,
-        };
-        send_load(&url, load).await
-    });
+    let loaders: Vec<_> = (0..senders)
+        .map(|sender| {
+            let url = network.http_url(sender as usize % network.len());
+            tokio::spawn(async move {
+                let load = Load {
+                    sender: sender_key(sender),
+                    count: per_sender,
+                    batch_size: BATCH_SIZE,
+                    forged_every: None,
+                };
+                send_load(&url, load).await
+            })
+        })
+        .collect();
     for _ in 0..rogue_blocks {
         network
             .send_bad_block(1)
             .await
             .expect("bad block is rejected");
     }
-    let load = loader.await.expect("load task");
+    let mut load = LoadReport::default();
+    for loader in loaders {
+        let report = loader.await.expect("load task");
+        load.submitted += report.submitted;
+        load.accepted += report.accepted;
+        load.rejected += report.rejected;
+        load.failed += report.failed;
+    }
     let loaded = started.elapsed();
+    load.elapsed = loaded;
     network
         .wait_until_synced(load.accepted, SYNC_TIMEOUT)
         .await
@@ -233,6 +256,37 @@ fn bench_catch_up(c: &mut Criterion, runtime: &Runtime) {
     group.finish();
 }
 
+/// Concurrent senders on every node, far above what the client demo sends:
+/// the TPS to sync shows the sustained capacity of the whole network.
+fn bench_stress(c: &mut Criterion, runtime: &Runtime) {
+    let mut group = c.benchmark_group("stress");
+    group
+        .sampling_mode(SamplingMode::Flat)
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(30));
+    for (senders, per_sender) in STRESS_LOADS {
+        let total = senders * per_sender;
+        let label = format!("{senders}x{per_sender}");
+        let id = format!("stress/concurrent_senders/{label}");
+        group.throughput(Throughput::Elements(total));
+        group.bench_function(BenchmarkId::new("concurrent_senders", &label), |b| {
+            b.to_async(runtime).iter_custom(|iters| {
+                let id = id.clone();
+                async move {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let run = load_until_synced_from(senders, per_sender, 0).await;
+                        total += run.sync;
+                        record(&id, run);
+                    }
+                    total
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 #[derive(Serialize)]
 struct Summary {
     runs: usize,
@@ -253,6 +307,7 @@ struct Summary {
     avg_propagation_ms: Option<f64>,
     avg_finality_ms: Option<f64>,
     tps_to_sync: Option<f64>,
+    max_block_txs: u64,
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -298,6 +353,7 @@ fn summarize(runs: &[Run]) -> Summary {
         avg_propagation_ms: mean(&all(|run| &run.propagation_ms)),
         avg_finality_ms: mean(&all(|run| &run.finality_ms)),
         tps_to_sync: (accepted > 0 && total_sync > 0.0).then(|| accepted as f64 / total_sync),
+        max_block_txs: runs.iter().map(|run| run.max_block_txs).max().unwrap_or(0),
     }
 }
 
@@ -328,19 +384,23 @@ fn print_report() {
             s.unexpected_resets
         );
         println!(
-            "  propagation {} ms | finality {} ms | tps to sync {}",
+            "  propagation {} ms | finality {} ms | tps to sync {} | biggest block {} txs",
             opt(s.avg_propagation_ms),
             opt(s.avg_finality_ms),
-            opt(s.tps_to_sync)
+            opt(s.tps_to_sync),
+            s.max_block_txs
         );
     }
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
     let path = target.join("criterion/network_stats.json");
-    let written = std::fs::create_dir_all(path.parent().expect("file has a parent"))
-        .and_then(|()| {
-            std::fs::write(&path, serde_json::to_vec_pretty(&summaries).expect("serializable"))
+    let written =
+        std::fs::create_dir_all(path.parent().expect("file has a parent")).and_then(|()| {
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&summaries).expect("serializable"),
+            )
         });
     match written {
         Ok(()) => println!("statistics written to {}", path.display()),
@@ -357,6 +417,7 @@ fn main() {
     bench_sync(&mut criterion, &runtime);
     bench_bad_sync(&mut criterion, &runtime);
     bench_catch_up(&mut criterion, &runtime);
+    bench_stress(&mut criterion, &runtime);
     criterion.final_summary();
     print_report();
 }

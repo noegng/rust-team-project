@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ed25519_dalek::VerifyingKey;
 
 use crate::block::{Block, BlockData, BlockError};
-use crate::transaction::TransactionError;
+use crate::transaction::{Transaction, TransactionError};
 
 /// Nombre maximal de transactions par bloc (règle de consensus).
 pub const MAX_TXS_PER_BLOCK: usize = 20_000;
@@ -112,7 +112,7 @@ impl Chain {
     /// Vérifie qu'un bloc peut être ajouté à la suite de la chaîne :
     /// index, lien, timestamp, hash, signature, proposant et transactions.
     pub fn validate_successor(&self, block: &Block) -> Result<(), ChainError> {
-        self.check_successor(block).map(|_| ())
+        self.check_successor(block, &|_| false).map(|_| ())
     }
 
     pub fn is_valid_successor(&self, block: &Block) -> bool {
@@ -121,14 +121,29 @@ impl Chain {
 
     /// Ajoute le bloc s'il est un successeur valide.
     pub fn push(&mut self, block: Block) -> Result<(), ChainError> {
-        let nonces = self.check_successor(&block)?;
+        self.push_trusted(block, |_| false)
+    }
+
+    /// Comme `push`, mais ne revérifie pas la signature des TX pour lesquelles
+    /// `verified(tx)` est vrai (ex. déjà vérifiées à l'entrée du mempool).
+    /// Toutes les autres règles (nonces, hashes, signature du bloc) s'appliquent.
+    pub fn push_trusted(
+        &mut self,
+        block: Block,
+        verified: impl Fn(&Transaction) -> bool,
+    ) -> Result<(), ChainError> {
+        let nonces = self.check_successor(&block, &verified)?;
         self.nonces.extend(nonces);
         self.blocks.push(block);
         Ok(())
     }
 
     /// Valide le bloc et retourne les nonces mis à jour par ses transactions.
-    fn check_successor(&self, block: &Block) -> Result<Nonces, ChainError> {
+    fn check_successor(
+        &self,
+        block: &Block,
+        verified: &dyn Fn(&Transaction) -> bool,
+    ) -> Result<Nonces, ChainError> {
         let last = self.last();
         let data = &block.block_data;
 
@@ -176,7 +191,9 @@ impl Chain {
         // et les doublons, dans le bloc comme d'un bloc à l'autre.
         let mut nonces = Nonces::new();
         for tx in &data.transactions {
-            tx.verify()?;
+            if !verified(tx) {
+                tx.verify()?;
+            }
             let expected = nonces
                 .get(&tx.from)
                 .copied()
@@ -427,6 +444,26 @@ mod tests {
             })
         ));
         assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn trusted_push_skips_signatures_but_not_other_rules() {
+        let mut forged = tx(0);
+        forged.amount += 1;
+        // Only a caller that verified the TX itself may trust it.
+        let mut trusting = chain();
+        trusting
+            .push_trusted(next_block(&trusting, vec![forged.clone()], &key(7)), |_| true)
+            .unwrap();
+        let mut strict = chain();
+        assert!(matches!(
+            strict.push(next_block(&strict, vec![forged], &key(7))),
+            Err(ChainError::InvalidTransaction(_))
+        ));
+        assert!(matches!(
+            trusting.push_trusted(next_block(&trusting, vec![tx(0)], &key(7)), |_| true),
+            Err(ChainError::InvalidNonce { .. })
+        ));
     }
 
     #[test]

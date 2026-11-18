@@ -46,6 +46,8 @@ pub struct NodeStats {
     pub sync_resets: u64,
     pub avg_propagation_ms: Option<u64>,
     pub avg_finality_ms: Option<u64>,
+    /// Largest number of TXs in one block of the local chain.
+    pub max_block_txs: u64,
 }
 
 impl Testnet {
@@ -131,6 +133,12 @@ impl Testnet {
             sync_resets: metrics.sync_resets,
             avg_propagation_ms: metrics.avg_propagation_ms,
             avg_finality_ms: metrics.avg_finality_ms,
+            max_block_txs: chain
+                .blocks()
+                .iter()
+                .map(|block| block.block_data.transactions.len() as u64)
+                .max()
+                .unwrap_or(0),
         }
     }
 
@@ -149,7 +157,7 @@ impl Testnet {
         committed_txs: u64,
         timeout: Duration,
     ) -> anyhow::Result<Duration> {
-        wait_for(timeout, "network sync", async || {
+        let result = wait_for(timeout, "network sync", async || {
             let mut min_len = u64::MAX;
             for node in 0..self.len() {
                 let stats = self.stats(node).await;
@@ -166,7 +174,19 @@ impl Testnet {
             }
             true
         })
-        .await
+        .await;
+        match result {
+            Ok(elapsed) => Ok(elapsed),
+            Err(error) => {
+                let mut nodes = Vec::new();
+                for node in 0..self.len() {
+                    nodes.push(self.stats(node).await);
+                }
+                Err(error.context(format!(
+                    "expected {committed_txs} committed TXs; nodes: {nodes:?}"
+                )))
+            }
+        }
     }
 
     /// Waits until `node` has at least `chain_len` blocks.
@@ -325,7 +345,10 @@ pub async fn send_load(url: &str, load: Load) -> LoadReport {
             // Timestamp set at send time: nodes measure propagation and finality from it.
             let tx = Transaction::new(&recipient, 1, nonce, unix_millis(), &load.sender)
                 .expect("signing a transaction cannot fail");
-            if load.forged_every.is_some_and(|k| k > 0 && (nonce + 1) % k == 0) {
+            if load
+                .forged_every
+                .is_some_and(|k| k > 0 && (nonce + 1) % k == 0)
+            {
                 let mut forged = tx.clone();
                 forged.amount += 1;
                 batch.push(tx);

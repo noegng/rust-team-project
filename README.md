@@ -216,8 +216,11 @@ cargo bench -p node --features testnet -- --test  # vérification rapide (1 ité
 | `bad_sync/reset_on_bad_block` | Temps pour qu'un node coupe un peer qui envoie un bloc invalide |
 | `bad_sync/load_with_bad_blocks/1000` | Même charge, pendant qu'un peer malveillant envoie 5 blocs invalides au node B |
 | `catch_up/late_node/1000` | Rattrapage d'un nouveau node sur une chaîne contenant 1000 TX |
+| `stress/concurrent_senders/{6,12}x5000` | Stress : 6 ou 12 expéditeurs concurrents répartis sur les 3 nodes (30 000 / 60 000 TX) jusqu'à la sync ; donne le débit soutenu du réseau |
 
-Après Criterion, le bench affiche et écrit dans `target/criterion/network_stats.json` : temps moyen / p50 / p95 / max de sync, lag après la fin de l'envoi, taux d'erreur (TX rejetées ou perdues / TX envoyées), nombre de resets de sync (total, par bloc invalide, inattendus), propagation et finalité moyennes, TPS jusqu'à la sync.
+`cargo bench -p node --features testnet -- stress` ne lance que le stress test.
+
+Après Criterion, le bench affiche et écrit dans `target/criterion/network_stats.json` : temps moyen / p50 / p95 / max de sync, lag après la fin de l'envoi, taux d'erreur (TX rejetées ou perdues / TX envoyées), nombre de resets de sync (total, par bloc invalide, inattendus), propagation et finalité moyennes, TPS jusqu'à la sync, plus gros bloc (limite `MAX_TXS_PER_BLOCK` = 20 000).
 
 ## Flamegraph par node (samply)
 

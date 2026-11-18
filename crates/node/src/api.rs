@@ -189,19 +189,21 @@ pub(crate) async fn submit_transactions(
     State(state): State<Arc<NodeState>>,
     Json(transactions): Json<Vec<Transaction>>,
 ) -> Json<Vec<TransactionResult>> {
-    let mut results = Vec::with_capacity(transactions.len());
-    for tx in transactions {
-        results.push(match state.submit_transaction(tx).await {
-            Ok(hash) => TransactionResult::Accepted { hash },
-            Err(error) => {
-                state.metrics.record_rejected_tx();
-                TransactionResult::Rejected {
-                    error: error.to_string(),
+    let results = state.submit_transactions(transactions).await;
+    Json(
+        results
+            .into_iter()
+            .map(|result| match result {
+                Ok(hash) => TransactionResult::Accepted { hash },
+                Err(error) => {
+                    state.metrics.record_rejected_tx();
+                    TransactionResult::Rejected {
+                        error: error.to_string(),
+                    }
                 }
-            }
-        });
-    }
-    Json(results)
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
